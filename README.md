@@ -17,6 +17,7 @@ The original competition ended on February 27, 2023. This is a research/reproduc
 - `scripts/train_advanced.py`: ConvNeXt-Tiny multi-view breast attention training, AMP, gradient accumulation, cosine scheduling, and EMA.
 - `scripts/train_vit.py`: ViT-B/16 multi-view breast experiment sharing the advanced training protocol for a controlled comparison.
 - `scripts/compare_runs.py`: same-fold run comparison with recomputed pF1, comparability warnings, and patient-level bootstrap intervals.
+- `scripts/evaluate.py`: scores a saved checkpoint on one withheld fold, refusing folds the run trained on.
 - `scripts/training_data.py`, `scripts/training_models.py`, and `scripts/training_common.py`: shared MDS metadata reconstruction, patient folds, image transforms, models, training, metrics, and checkpoints.
 - `scripts/test_training*.py`: metadata/fold/transform/model tests and one-epoch synthetic CPU training tests.
 
@@ -414,6 +415,27 @@ python -m torch.distributed.run --nnodes 1 --nproc-per-node 4 \
 
 Expect ViTs to be more sensitive than the CNNs here: attention cost grows quadratically with token count, so 384 pixels already means 576 patches, and higher resolutions increase memory quickly. The default learning rate is lower (3e-5) because ViTs typically need it, and transformers usually need more data or stronger augmentation than this ImageNet-pretrained fine-tuning recipe provides. **Whether ViT beats ConvNeXt on this dataset is an open question that only your measured results can answer**; a fair comparison needs the same fold, seed, epochs, and comparable effective batch, and ideally several folds and seeds.
 
+### Train, validation, and a locked test fold
+
+Validation is used to pick epochs, pooling, and thresholds, so its score is optimistic by construction. For a defensible final number, withhold a fold from training **and** validation, then score it once:
+
+```bash
+python -u scripts/train_vit.py --fold 3 --exclude-folds 4 \
+  --cache /local_disk0/rsna_training/vit_f3 \
+  --out /Volumes/.../train_vit_f3
+
+python scripts/evaluate.py --fold 4 \
+  --checkpoint /Volumes/.../train_vit_f3/best.pt \
+  --cache /local_disk0/rsna_eval/vit_f3 \
+  --out /Volumes/.../eval_vit_f3_test
+```
+
+`--exclude-folds` accepts several folds and is rejected if it contains the validation `--fold` or leaves no training data. `config.json` records `excluded_folds` with the withheld patient and image counts, so any run's split is auditable afterwards.
+
+`scripts/evaluate.py` is a separate entry point on purpose: scoring cannot be triggered from the training loop, so a test fold cannot influence checkpoint selection. It takes the approach, image size, intensity scaling, pooling, folds, and seed **from the checkpoint** so preprocessing matches training exactly, and it verifies the dataset CSV and index hashes before scoring. It **refuses folds that the run trained on**, and refuses the run's own validation fold unless you pass `--allow-selection-fold`, in which case the report is explicitly marked as not an unbiased estimate. The report records `unbiased_test_estimate`, the checkpoint SHA-256, epoch, weight choice (EMA or raw), full metrics, and the constant-prevalence baseline, beside `predictions.csv` and `labels.csv` for the metric CLI. Any epoch checkpoint can be scored, not just `best.pt`.
+
+**With roughly 98 positive breasts per fold, a single test fold gives a wide interval.** Prefer this workflow: lock one fold, use the remaining folds for model selection (ideally rotating the validation fold and pooling out-of-fold predictions across roughly 390 positive breasts), then unlock the test fold exactly once for the chosen configuration. Each additional look at the test fold weakens it; re-running `evaluate.py` on new output directories is not a substitute for a fresh held-out set.
+
 ### Comparing runs
 
 ```bash
@@ -451,11 +473,12 @@ To support Unity Catalog Volume limitations, checkpoint ZIP serialization happen
 python -B scripts/train_simple.py --help
 python -B scripts/train_advanced.py --help
 python -B scripts/train_vit.py --help
+python -B scripts/evaluate.py --help
 python -B scripts/compare_runs.py --help
 python -B -m unittest discover -s scripts -p 'test_*.py' -v
 ```
 
-Training tests include real ResNet-18, ConvNeXt-Tiny, and ViT-B/16 CPU forward/backward passes and one synthetic MDS training epoch per approach, with `--no-pretrained`, 64-pixel inputs, and no external downloads. They also exercise a real two-process `torchrun` run that must reproduce the single-process folds and full-fold validation, spawned MDS loader workers, fold isolation, skipped-image ordering, 16-bit scaling, attention masks, ViT position-embedding interpolation, gradient accumulation, EMA, metrics, checkpoint reloads, and the comparison report's comparability guards. `--max-train-batches` is a debug-only cap on training, not validation; do not compare such runs as fully trained models. Passing these tests demonstrates pipeline behavior, not breast-cancer detection performance.
+Training tests include real ResNet-18, ConvNeXt-Tiny, and ViT-B/16 CPU forward/backward passes and one synthetic MDS training epoch per approach, with `--no-pretrained`, 64-pixel inputs, and no external downloads. They also exercise a real two-process `torchrun` run that must reproduce the single-process folds and full-fold validation, spawned MDS loader workers, fold isolation, skipped-image ordering, 16-bit scaling, attention masks, ViT position-embedding interpolation, gradient accumulation, EMA, metrics, checkpoint reloads, per-epoch checkpoints, withheld-fold exclusion, the evaluation script's refusal of training and selection folds, and the comparison report's comparability guards. `--max-train-batches` is a debug-only cap on training, not validation; do not compare such runs as fully trained models. Passing these tests demonstrates pipeline behavior, not breast-cancer detection performance.
 
 ## Evaluation protocol for trustworthy experiments
 

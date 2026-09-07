@@ -265,6 +265,9 @@ def build_parser(approach):
     parser.add_argument('--clip-grad', type=float, default=1.0)
     parser.add_argument('--folds', type=int, default=5)
     parser.add_argument('--fold', type=int, default=0)
+    parser.add_argument('--exclude-folds', type=int, nargs='*', default=[], metavar='FOLD',
+                        help='Folds withheld from training and validation, for a locked test set '
+                             'scored later by scripts/evaluate.py.')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num-workers', type=int, default=4 if approach == 'simple' else 2,
                         help='Loader workers per process; total workers scale with the number of GPUs.')
@@ -304,6 +307,13 @@ def validate_args(args, approach='simple'):
         raise ValueError('--image-size must be a multiple of 16 for the ViT patch grid.')
     if args.folds < 2 or not 0 <= args.fold < args.folds:
         raise ValueError('--folds must be at least 2 and --fold must be in 0..folds-1.')
+    excluded = sorted(set(args.exclude_folds))
+    if len(excluded) != len(args.exclude_folds) or any(not 0 <= fold < args.folds for fold in excluded):
+        raise ValueError('--exclude-folds must list distinct folds in 0..folds-1.')
+    if args.fold in excluded:
+        raise ValueError('--exclude-folds must not contain the validation --fold.')
+    if len(excluded) >= args.folds - 1:
+        raise ValueError('--exclude-folds leaves no training folds.')
     if args.max_train_batches is not None and args.max_train_batches < 1:
         raise ValueError('--max-train-batches must be positive.')
     for name in ('lr', 'clip_grad'):
@@ -373,8 +383,12 @@ def _train(args, approach, cluster, device):
     if output == source_images or output in source_images.parents or source_images in output.parents:
         raise ValueError('Run output must be separate from the original source images directory.')
     folds = patient_fold_assignments(records, args.folds, args.seed)
-    train_indices = [i for i, record in enumerate(records) if folds[record.patient_id] != args.fold]
+    withheld = set(args.exclude_folds)
+    train_indices = [i for i, record in enumerate(records)
+                     if folds[record.patient_id] != args.fold and folds[record.patient_id] not in withheld]
     val_indices = [i for i, record in enumerate(records) if folds[record.patient_id] == args.fold]
+    if not train_indices:
+        raise ValueError('No training images remain after applying --fold and --exclude-folds.')
     backend = RSNAStreamingDataset(remote=str(remote), local=str(local), decode_images=True,
                                    shuffle=False, batch_size=1, cache_limit=args.cache_limit)
     train_transform = ImageTransform(args.image_size, training=True, intensity_max=args.intensity_max)
@@ -428,6 +442,9 @@ def _train(args, approach, cluster, device):
         'world_size': cluster.world_size,
         'effective_batch_breasts_or_images': args.batch_size * args.grad_accum * cluster.world_size,
         'amp_dtype': str(amp_dtype) if amp else None,
+        'excluded_folds': sorted(withheld),
+        'excluded_patients': len({patient for patient, fold in folds.items() if fold in withheld}),
+        'excluded_images': sum(folds[record.patient_id] in withheld for record in records),
         'train_images': len(train_indices), 'validation_images': len(val_indices),
         'train_breasts': len(train_truth), 'validation_breasts': len(val_truth),
         'train_positive_breasts': sum(train_truth.values()),
