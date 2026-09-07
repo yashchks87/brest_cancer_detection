@@ -18,6 +18,7 @@ from scripts.convert_to_mds import (
     ProgressTracker,
     build_parser,
     convert,
+    find_missing_images,
     load_records,
     load_sample,
     ordered_parallel_map,
@@ -110,6 +111,24 @@ class CSVTests(unittest.TestCase):
         images.mkdir()
         with self.assertRaisesRegex(ValueError, 'separate'):
             validate_output(images / 'output', images)
+
+    def test_preflight_collects_all_missing_paths(self):
+        records, _ = self.load()
+        records[1].path.write_bytes(b'image')
+        with ProgressTracker(mode='none') as progress:
+            missing = find_missing_images(records, 2, 2, progress)
+            self.assertEqual(progress.count, 3)
+        self.assertEqual(missing, [records[0], records[2]])
+
+    def test_preflight_does_not_treat_permissions_or_directories_as_missing(self):
+        records, _ = self.load()
+        with ProgressTracker(mode='none') as progress:
+            with patch.object(Path, 'stat', side_effect=PermissionError('access denied')):
+                with self.assertRaises(PermissionError):
+                    find_missing_images(records, 2, 2, progress)
+            records[0].path.mkdir()
+            with self.assertRaisesRegex(ValueError, 'regular file'):
+                find_missing_images(records, 2, 2, progress)
 
     def test_parallel_map_is_ordered_and_propagates_failure(self):
         def delayed(value):
@@ -249,6 +268,16 @@ class ProgressTests(unittest.TestCase):
                     ProgressTracker(interval=interval)
         with self.assertRaisesRegex(ValueError, 'progress-every'):
             ProgressTracker(every=0)
+
+    def test_warnings_survive_disabled_progress_and_reset_terminal_frame(self):
+        for mode in ['bar', 'none']:
+            with self.subTest(mode=mode):
+                stream = io.StringIO()
+                with ProgressTracker(interval=60, mode=mode, stream=stream) as progress:
+                    progress.set_stage('Checking source files', total=2)
+                    progress.warn('Skipping 1 missing images')
+                    self.assertEqual(progress.height, 0)
+                self.assertIn('WARNING: Skipping 1 missing images\n', stream.getvalue())
 
     def test_cli_progress_options(self):
         parser = build_parser()
@@ -447,13 +476,171 @@ class ConversionTests(unittest.TestCase):
 
     def test_missing_and_corrupt_inputs_leave_no_success(self):
         (self.images / '1_10.png').unlink()
-        with self.assertRaises(FileNotFoundError):
+        with self.assertRaisesRegex(FileNotFoundError, 'Missing 1 of 2 selected source images'):
             convert(self.args())
-        self.assertFalse((self.root / 'output' / '_SUCCESS').exists())
+        self.assertFalse((self.root / 'output').exists())
         (self.images / '1_10.png').write_bytes(b'not an image')
         with self.assertRaises(OSError):
             convert(self.args('corrupt'))
         self.assertFalse((self.root / 'corrupt' / '_SUCCESS').exists())
+
+    def test_missing_report_preserves_source_and_creates_no_shards(self):
+        (self.images / '1_10.png').unlink()
+        (self.images / '1_11.png').unlink()
+        source = self.csv_path.read_bytes()
+        report = self.root / 'missing.json'
+        stream = io.StringIO()
+        with redirect_stderr(stream):
+            with self.assertRaisesRegex(FileNotFoundError, 'Missing 2 of 2'):
+                convert(self.args('output', '--missing-report', str(report)))
+        data = json.loads(report.read_text())
+        self.assertEqual(data['missing_count'], 2)
+        self.assertEqual(data['selected_samples'], 2)
+        self.assertEqual({image['image_id'] for image in data['missing_images']}, {'10', '11'})
+        self.assertEqual({image['path'] for image in data['missing_images']},
+                         {str(self.images / '1_10.png'), str(self.images / '1_11.png')})
+        self.assertEqual(self.csv_path.read_bytes(), source)
+        self.assertFalse((self.root / 'output').exists())
+        self.assertNotIn('Initializing MDS writer', stream.getvalue())
+        self.assertIn('Failed during Checking source files', stream.getvalue())
+
+    def test_dry_run_catches_missing_image_after_first_eight(self):
+        rows = []
+        for image_id in range(10, 20):
+            rows.append(['1', str(image_id), 'L', 'MLO', '1'])
+            if image_id < 19:
+                self.Image.fromarray(self.pixels).save(self.images / f'1_{image_id}.png')
+        with self.csv_path.open('w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['patient_id', 'image_id', 'laterality', 'view', 'cancer'])
+            writer.writerows(rows)
+        report = self.root / 'dry-missing.json'
+        with self.assertRaisesRegex(FileNotFoundError, '1_19.png'):
+            convert(self.args('preview', '--dry-run', '--no-shuffle',
+                              '--missing-report', str(report)))
+        self.assertEqual(json.loads(report.read_text())['selected_samples'], 10)
+        self.assertFalse((self.root / 'preview').exists())
+        summary = convert(self.args('limited', '--dry-run', '--no-shuffle', '--limit', '8'))
+        self.assertEqual(summary['source_files_checked'], 8)
+
+    def test_missing_report_never_overwrites_or_writes_inside_sources_or_output(self):
+        report = self.root / 'existing.json'
+        report.write_text('untouched')
+        with self.assertRaises(FileExistsError):
+            convert(self.args('output', '--missing-report', str(report)))
+        self.assertEqual(report.read_text(), 'untouched')
+        for report in [self.images / 'missing.json', self.root / 'output',
+                       self.root / 'output' / 'missing.json']:
+            with self.subTest(report=report):
+                with self.assertRaises(ValueError):
+                    convert(self.args('output', '--missing-report', str(report)))
+        self.assertFalse((self.root / 'output').exists())
+
+    def test_missing_report_not_written_for_valid_inputs(self):
+        report = self.root / 'missing.json'
+        summary = convert(self.args('preview', '--dry-run', '--missing-report', str(report)))
+        self.assertEqual(summary['source_files_checked'], 2)
+        self.assertFalse(report.exists())
+
+    def test_image_disappearing_after_preflight_still_fails(self):
+        with patch('scripts.convert_to_mds.load_sample', side_effect=FileNotFoundError('gone')):
+            with self.assertRaisesRegex(FileNotFoundError, 'gone'):
+                convert(self.args())
+        self.assertFalse((self.root / 'output' / '_SUCCESS').exists())
+
+    def test_skip_missing_writes_remaining_images_and_audit(self):
+        from scripts.benchmark_mds import read_manifest
+
+        (self.images / '1_10.png').unlink()
+        with self.csv_path.open('a', newline='') as file:
+            csv.writer(file).writerow(['2', '20', 'R', 'CC', '0', '50'])
+        source = self.csv_path.read_bytes()
+        stream = io.StringIO()
+        with redirect_stderr(stream):
+            summary = convert(self.args('output', '--skip-missing', '--no-progress'))
+        self.assertEqual(summary['csv_rows'], 3)
+        self.assertEqual(summary['selected_samples'], 3)
+        self.assertEqual(summary['source_files_checked'], 3)
+        self.assertEqual(summary['samples'], 1)
+        self.assertEqual(summary['patients'], 1)
+        self.assertEqual(summary['breasts'], 1)
+        self.assertEqual(summary['positive_images'], 1)
+        self.assertEqual(summary['missing_policy'], 'skip')
+        self.assertEqual(summary['skipped_missing_images'], 2)
+        self.assertEqual({image['sample_id'] for image in summary['skipped_images']},
+                         {'1_10', '2_20'})
+        self.assertEqual(sum(image['cancer'] for image in summary['skipped_images']), 1)
+        self.assertEqual(summary, read_manifest(self.root / 'output'))
+        self.assertEqual(json.loads((self.root / 'output' / '_SUCCESS').read_text()), {'samples': 1})
+        dataset = self.LocalDataset(local=str(self.root / 'output'))
+        self.assertEqual(len(dataset), 1)
+        self.assertEqual(dataset[0]['sample_id'], '1_11')
+        self.assertEqual(dataset[0]['image'], (self.images / '1_11.png').read_bytes())
+        self.assertEqual(self.csv_path.read_bytes(), source)
+        self.assertIn('WARNING: Skipping 2 missing images', stream.getvalue())
+
+    def test_skip_missing_dry_run_with_optional_report(self):
+        (self.images / '1_10.png').unlink()
+        report = self.root / 'missing.json'
+        stream = io.StringIO()
+        with redirect_stderr(stream):
+            summary = convert(self.args('preview', '--skip-missing', '--dry-run',
+                                        '--missing-report', str(report)))
+        self.assertEqual(summary['samples'], 1)
+        self.assertEqual(summary['images_checked'], 1)
+        self.assertEqual(summary['source_files_checked'], 2)
+        self.assertEqual(summary['skipped_missing_images'], 1)
+        self.assertEqual(summary['skipped_images'], json.loads(report.read_text())['missing_images'])
+        self.assertFalse((self.root / 'preview').exists())
+        self.assertIn('no shards written', stream.getvalue())
+        self.assertNotIn('no output written', stream.getvalue())
+
+    def test_cli_skip_missing_keeps_json_stdout(self):
+        (self.images / '1_10.png').unlink()
+        result = subprocess.run([
+            sys.executable, '-B', '-m', 'scripts.convert_to_mds',
+            '--csv', str(self.csv_path), '--images-dir', str(self.images),
+            '--out', str(self.root / 'preview'), '--dry-run', '--skip-missing', '--no-progress',
+        ], text=True, capture_output=True, check=True)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary['samples'], 1)
+        self.assertEqual(summary['skipped_missing_images'], 1)
+        self.assertIn('WARNING: Skipping 1 missing images', result.stderr)
+        self.assertFalse((self.root / 'preview').exists())
+
+    def test_skip_missing_rejects_empty_dataset(self):
+        (self.images / '1_10.png').unlink()
+        (self.images / '1_11.png').unlink()
+        with self.assertRaisesRegex(ValueError, 'No source images remain'):
+            convert(self.args('empty', '--skip-missing'))
+        self.assertFalse((self.root / 'empty').exists())
+
+    def test_skip_missing_does_not_hide_other_failures(self):
+        for index, error in enumerate([PermissionError('unreadable'),
+                                       FileNotFoundError('disappeared after preflight')]):
+            with self.subTest(error=error):
+                output = f'failed-{index}'
+                with patch('scripts.convert_to_mds.load_sample', side_effect=error):
+                    with self.assertRaises(type(error)):
+                        convert(self.args(output, '--skip-missing'))
+                self.assertFalse((self.root / output / '_SUCCESS').exists())
+        (self.images / '1_10.png').write_bytes(b'not an image')
+        with self.assertRaises(OSError):
+            convert(self.args('corrupt-skip', '--skip-missing'))
+        self.assertFalse((self.root / 'corrupt-skip' / '_SUCCESS').exists())
+
+    def test_skip_missing_limit_does_not_replace_excluded_rows(self):
+        (self.images / '1_10.png').unlink()
+        with self.assertRaisesRegex(ValueError, 'No source images remain'):
+            convert(self.args('limited', '--skip-missing', '--limit', '1'))
+        self.assertFalse((self.root / 'limited').exists())
+
+    def test_skip_missing_flag_is_opt_in(self):
+        self.assertFalse(self.args().skip_missing)
+        summary = convert(self.args('preview', '--dry-run'))
+        self.assertEqual(summary['missing_policy'], 'error')
+        self.assertEqual(summary['skipped_missing_images'], 0)
+        self.assertEqual(summary['skipped_images'], [])
 
     def test_deterministic_shard_bytes(self):
         convert(self.args('first'))

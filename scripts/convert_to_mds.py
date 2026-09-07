@@ -6,6 +6,7 @@ import json
 import math
 import random
 import shutil
+import stat
 import string
 import sys
 import textwrap
@@ -86,6 +87,16 @@ class ProgressTracker:
     def _heartbeat(self):
         while not self.stop.wait(self.interval):
             self.refresh()
+
+    def warn(self, message):
+        with self.lock:
+            if self.mode == 'bar' and self.height:
+                self._render(self.clock(), final=True)
+                self.height = 0
+            try:
+                print(f'WARNING: {message}', file=self.stream, flush=True)
+            except (OSError, ValueError):
+                self.mode = 'none'
 
     def set_stage(self, stage, total=None):
         with self.lock:
@@ -284,6 +295,30 @@ def ordered_parallel_map(function, items, workers: int, prefetch: int):
         executor.shutdown(wait=True, cancel_futures=True)
 
 
+def find_missing_images(records: list[Record], workers: int, prefetch: int,
+                        progress: ProgressTracker) -> list[Record]:
+    def check(record):
+        try:
+            mode = record.path.stat().st_mode
+        except FileNotFoundError:
+            return record
+        if not stat.S_ISREG(mode):
+            raise ValueError(f'Expected a regular file for source image: {record.path}')
+        return None
+
+    progress.set_stage('Checking source files', total=len(records))
+    missing = []
+    results = ordered_parallel_map(check, records, workers, prefetch)
+    try:
+        for record in results:
+            if record is not None:
+                missing.append(record)
+            progress.advance(0)
+    finally:
+        results.close()
+    return missing
+
+
 def validate_output(output: Path, images_dir: Path) -> None:
     if output.exists():
         raise FileExistsError(f'Output already exists; choose a new version directory: {output}')
@@ -312,6 +347,11 @@ def _convert(args: argparse.Namespace, progress: ProgressTracker) -> dict:
     if not images_dir.is_dir():
         raise ValueError(f'Images directory not found: {images_dir}')
     validate_output(output, images_dir)
+    report_path = args.missing_report.resolve() if args.missing_report is not None else None
+    if report_path is not None:
+        if report_path == output or output in report_path.parents:
+            raise ValueError('--missing-report must be outside the MDS output directory.')
+        validate_output(report_path, images_dir)
     progress.set_stage('Validating CSV')
     records, csv_sha256 = load_records(csv_path, images_dir, args.image_pattern)
     csv_rows = len(records)
@@ -326,19 +366,73 @@ def _convert(args: argparse.Namespace, progress: ProgressTracker) -> dict:
         'image_pattern': args.image_pattern,
         'image_storage': args.image_storage,
         'csv_rows': csv_rows,
-        'samples': len(records),
-        'patients': len({record.metadata['patient_id'] for record in records}),
-        'breasts': len({record.prediction_id for record in records}),
-        'positive_images': sum(record.metadata['cancer'] == '1' for record in records),
+        'selected_samples': len(records),
+        'source_files_checked': len(records),
+        'missing_policy': 'skip' if args.skip_missing else 'error',
         'shard_size_mb': args.shard_size_mb,
         'compression': None if args.compression == 'none' else args.compression,
         'shuffle_seed': None if args.no_shuffle else args.seed,
         'limit': args.limit,
         'output': str(output),
     }
+    missing = find_missing_images(records, args.workers, args.prefetch, progress)
+    missing_images = [
+        {'sample_id': f"{record.metadata['patient_id']}_{record.metadata['image_id']}",
+         'patient_id': record.metadata['patient_id'], 'image_id': record.metadata['image_id'],
+         'prediction_id': record.prediction_id, 'cancer': int(record.metadata['cancer']),
+         'path': str(record.path)}
+        for record in missing
+    ]
+    if missing:
+        paths = '\n'.join(str(record.path) for record in missing[:20])
+        message = (f'Missing {len(missing)} of {len(records)} selected source images. '
+                   f'No MDS output was created.\n{paths}\n'
+                   'Restore the original files or correct --images-dir/--image-pattern; '
+                   'no images were skipped.')
+        if report_path is not None:
+            report = {
+                'created_utc': datetime.now(timezone.utc).isoformat(),
+                'csv': str(csv_path),
+                'csv_sha256': csv_sha256,
+                'images_dir': str(images_dir),
+                'image_pattern': args.image_pattern,
+                'selected_samples': len(records),
+                'missing_count': len(missing),
+                'missing_images': missing_images,
+            }
+            with report_path.open('x', encoding='utf-8') as file:
+                json.dump(report, file, indent=2)
+                file.write('\n')
+            message += f'\nComplete missing-image report: {report_path}'
+        else:
+            message += '\nUse --missing-report NEW_PATH to save the complete list as JSON.'
+        if len(missing) > 20:
+            message += '\nOnly the first 20 missing paths are shown above.'
+        if not args.skip_missing:
+            raise FileNotFoundError(message)
+        missing_paths = {record.path for record in missing}
+        records = [record for record in records if record.path not in missing_paths]
+        if not records:
+            raise ValueError('No source images remain after --skip-missing; no MDS output was created.')
+        progress.warn(f'Skipping {len(missing)} missing images; retaining '
+                      f'{len(records)}/{summary["selected_samples"]} selected images. '
+                      'The source CSV is unchanged. Exclusions are included in the final summary/manifest.')
+        progress.completion = f'Complete ({len(missing)} missing images skipped)'
+    summary.update({
+        'samples': len(records),
+        'patients': len({record.metadata['patient_id'] for record in records}),
+        'breasts': len({record.prediction_id for record in records}),
+        'positive_images': sum(record.metadata['cancer'] == '1' for record in records),
+        'skipped_missing_images': len(missing),
+        'skipped_images': missing_images,
+    })
     max_sample_bytes = args.max_sample_mb * 1024 * 1024
     if args.dry_run:
-        progress.completion = 'Dry run complete (no output written)'
+        progress.completion = ('Dry run complete (no shards written; missing-image report saved)'
+                               if missing and report_path is not None
+                               else 'Dry run complete (no output written)')
+        if missing:
+            progress.completion += f'; {len(missing)} missing images skipped'
         progress.set_stage('Checking dry-run images', total=min(8, len(records)))
         for record in records[:8]:
             sample = load_sample(record, args.image_storage, max_sample_bytes)
@@ -430,8 +524,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--progress-every', type=int, default=1000,
                         help='Also report every N processed images (default: 1000). '
                              'Image ETA excludes finalization; payload MiB/s is not disk bandwidth.')
+    parser.add_argument('--skip-missing', action='store_true',
+                        help='Explicitly exclude images missing at preflight and audit them in the '
+                             'summary/manifest. Corrupt, unreadable, or later-disappearing images still fail.')
+    parser.add_argument('--missing-report', type=Path,
+                        help='New JSON file for all missing images, outside source images/output. '
+                             'Written only on missing inputs, including during --dry-run/--skip-missing.')
     parser.add_argument('--dry-run', action='store_true',
-                        help='Validate CSV and up to eight selected images; write nothing.')
+                        help='Validate CSV, check every selected image path, and load up to eight '
+                             'images; create no shards (optional --missing-report may be written).')
     return parser
 
 

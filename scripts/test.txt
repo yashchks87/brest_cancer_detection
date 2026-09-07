@@ -1,0 +1,9 @@
+python -u /root/brest_cancer_detection/scripts/convert_to_mds.py \
+  --csv "/Volumes/daai_ke_team/default/images/cancer_dataset/train 3.csv" \
+  --images-dir "/Volumes/daai_ke_team/default/images/cancer_dataset/images" \
+  --out "/Volumes/daai_ke_team/default/images/cancer_dataset/shrads/cancer_dataset_mds_v2" \
+  --workers 8 \
+  --prefetch 16 \
+  --shard-size-mb 256 \
+  --progress auto \
+  --progress-interval 1
