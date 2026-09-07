@@ -3,9 +3,12 @@ import csv
 import hashlib
 import io
 import json
+import math
 import random
+import shutil
 import string
 import sys
+import textwrap
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +17,7 @@ from datetime import datetime, timezone
 from importlib.metadata import version
 from itertools import islice
 from pathlib import Path
+from threading import TIMEOUT_MAX, Event, Lock, Thread
 
 
 DEFAULT_SOURCE = Path('/Volumes/daai_ke_team/default/images/cancer_dataset')
@@ -28,6 +32,136 @@ COLUMNS = {
     'cancer': 'int',
     'metadata': 'json',
 }
+
+
+class ProgressTracker:
+    def __init__(self, interval=1.0, every=1000, mode='auto', stream=None, clock=None):
+        if not math.isfinite(interval) or not 0 < interval <= TIMEOUT_MAX:
+            raise ValueError('--progress-interval must be finite, positive, and within timer limits.')
+        if every < 1:
+            raise ValueError('--progress-every must be positive.')
+        if mode not in ('auto', 'bar', 'log', 'none'):
+            raise ValueError('--progress must be auto, bar, log, or none.')
+        self.stream = sys.stderr if stream is None else stream
+        self.mode = ('bar' if self.stream.isatty() else 'log') if mode == 'auto' else mode
+        self.interval = interval
+        self.every = every
+        self.clock = time.perf_counter if clock is None else clock
+        self.started = self.clock()
+        self.last_activity = self.started
+        self.sample_start = None
+        self.sample_end = None
+        self.stage = 'Validating inputs'
+        self.completion = 'Complete'
+        self.total = None
+        self.count = 0
+        self.payload_bytes = 0
+        self.lock = Lock()
+        self.stop = Event()
+        self.thread = None
+        self.height = 0
+
+    def __enter__(self):
+        self.refresh()
+        if self.mode != 'none':
+            self.thread = Thread(target=self._heartbeat, name='mds-progress', daemon=True)
+            self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join()
+        with self.lock:
+            now = self.clock()
+            if self.sample_start is not None and self.sample_end is None:
+                self.sample_end = now
+            if exc_type is None:
+                self.stage = self.completion
+            else:
+                status = 'Interrupted' if issubclass(exc_type, KeyboardInterrupt) else 'Failed'
+                self.stage = f'{status} during {self.stage}'
+            self._render(now, final=True)
+
+    def _heartbeat(self):
+        while not self.stop.wait(self.interval):
+            self.refresh()
+
+    def set_stage(self, stage, total=None):
+        with self.lock:
+            now = self.clock()
+            self.stage = stage
+            self.last_activity = now
+            if total is not None:
+                self.total = total
+                self.count = self.payload_bytes = 0
+                self.sample_start, self.sample_end = now, None
+            elif self.sample_start is not None and self.sample_end is None:
+                self.sample_end = now
+            self._render(now)
+
+    def advance(self, payload_bytes):
+        with self.lock:
+            self.count += 1
+            self.payload_bytes += payload_bytes
+            self.last_activity = self.clock()
+            if self.count % self.every == 0 or self.count == self.total:
+                self._render(self.last_activity)
+
+    def refresh(self):
+        with self.lock:
+            self._render(self.clock())
+
+    @staticmethod
+    def _duration(seconds):
+        if seconds is None:
+            return '--'
+        hours, remainder = divmod(int(max(0, seconds)), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+
+    def _render(self, now, final=False):
+        if self.mode == 'none':
+            return
+        parts = [self.stage]
+        if self.total is not None:
+            fraction = self.count / self.total if self.total else 0.0
+            bar = f'[{"#" * int(fraction * 10):.<10}] ' if self.mode == 'bar' else ''
+            parts.append(f'{bar}{self.count}/{self.total} images ({fraction * 100:.1f}%)')
+            sample_end = now if self.sample_end is None else self.sample_end
+            elapsed = max(0.0, sample_end - self.sample_start)
+            rate = self.count / elapsed if elapsed else 0.0
+            eta = (self.total - self.count) / rate if rate and self.sample_end is None else None
+            parts.extend([f'image ETA {self._duration(eta)}', f'avg {rate:.1f} images/s'])
+        parts.append(f'elapsed {self._duration(now - self.started)}')
+        if self.total is not None:
+            mib = self.payload_bytes / (1024 * 1024)
+            bandwidth = mib / elapsed if elapsed else 0.0
+            parts.append(f'payload {mib:.1f} MiB ({bandwidth:.1f} MiB/s)')
+        if not final:
+            parts.append(f'idle {self._duration(now - self.last_activity)}')
+        line = ' | '.join(parts)
+        try:
+            if self.mode == 'bar':
+                columns = max(1, shutil.get_terminal_size().columns - 1)
+                lines = []
+                for part in parts:
+                    if lines and len(lines[-1]) + len(part) + 3 <= columns:
+                        lines[-1] += ' | ' + part
+                    else:
+                        lines.extend(textwrap.wrap(part, width=columns))
+                height = max(self.height, len(lines))
+                lines.extend([''] * (height - len(lines)))
+                rewind = f'\x1b[{self.height - 1}A' if self.height > 1 else ''
+                frame = '\n'.join('\r\x1b[2K' + row for row in lines)
+                self.stream.write(rewind + frame + ('\n' if final else ''))
+                self.height = height
+            else:
+                timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                self.stream.write(f'{timestamp} | {line}\n')
+            self.stream.flush()
+        except (OSError, ValueError):
+            self.mode = 'none'
 
 
 @dataclass(frozen=True)
@@ -166,14 +300,19 @@ def convert(args: argparse.Namespace) -> dict:
         raise ValueError('--shard-size-mb must be 1..4095 and --max-sample-mb must be positive.')
     if args.limit is not None and args.limit < 1:
         raise ValueError('--limit must be positive.')
-    if args.progress_every < 1:
-        raise ValueError('--progress-every must be positive.')
+    with ProgressTracker(interval=args.progress_interval, every=args.progress_every,
+                         mode=args.progress) as progress:
+        return _convert(args, progress)
+
+
+def _convert(args: argparse.Namespace, progress: ProgressTracker) -> dict:
     images_dir = args.images_dir.resolve()
     csv_path = args.csv.resolve()
     output = args.out.resolve()
     if not images_dir.is_dir():
         raise ValueError(f'Images directory not found: {images_dir}')
     validate_output(output, images_dir)
+    progress.set_stage('Validating CSV')
     records, csv_sha256 = load_records(csv_path, images_dir, args.image_pattern)
     csv_rows = len(records)
     records = records[:args.limit]
@@ -199,12 +338,18 @@ def convert(args: argparse.Namespace) -> dict:
     }
     max_sample_bytes = args.max_sample_mb * 1024 * 1024
     if args.dry_run:
+        progress.completion = 'Dry run complete (no output written)'
+        progress.set_stage('Checking dry-run images', total=min(8, len(records)))
         for record in records[:8]:
-            load_sample(record, args.image_storage, max_sample_bytes)
+            sample = load_sample(record, args.image_storage, max_sample_bytes)
+            payload = sample['image']
+            progress.advance(len(payload) if isinstance(payload, bytes) else payload.nbytes)
         return {**summary, 'dry_run': True, 'images_checked': min(8, len(records))}
 
+    progress.set_stage('Loading MDS dependencies')
     from streaming import MDSWriter
 
+    progress.set_stage('Initializing MDS writer')
     output.mkdir(exist_ok=False)
     columns = {**COLUMNS, 'image': args.image_storage}
     start = time.perf_counter()
@@ -218,17 +363,18 @@ def convert(args: argparse.Namespace) -> dict:
         with MDSWriter(out=str(output), columns=columns,
                        size_limit=args.shard_size_mb * 1024 * 1024,
                        compression=summary['compression'], hashes=['sha256']) as writer:
+            progress.set_stage('Converting images', total=len(records))
             for sample in samples:
                 writer.write(sample)
                 payload = sample['image']
-                payload_bytes += len(payload) if isinstance(payload, bytes) else payload.nbytes
+                sample_bytes = len(payload) if isinstance(payload, bytes) else payload.nbytes
+                payload_bytes += sample_bytes
                 count += 1
-                if count % args.progress_every == 0:
-                    elapsed = time.perf_counter() - start
-                    print(f'{count}/{len(records)} images; {count / elapsed:.1f} images/s',
-                          file=sys.stderr, flush=True)
+                progress.advance(sample_bytes)
+            progress.set_stage('Finalizing shards')
     finally:
         samples.close()
+    progress.set_stage('Verifying output')
     index_path = output / 'index.json'
     index = json.loads(index_path.read_text(encoding='utf-8'))
     indexed_samples = sum(shard['samples'] for shard in index['shards'])
@@ -245,6 +391,7 @@ def convert(args: argparse.Namespace) -> dict:
         'images_per_second': count / elapsed,
         'index_sha256': hashlib.sha256(index_path.read_bytes()).hexdigest(),
     })
+    progress.set_stage(f'Publishing manifest ({len(index["shards"])} shards)')
     with (output / 'conversion.json').open('x', encoding='utf-8') as file:
         json.dump(summary, file, indent=2)
         file.write('\n')
@@ -274,7 +421,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--no-shuffle', action='store_true')
     parser.add_argument('--limit', type=int, help='Convert only the first N CSV rows, for smoke tests.')
-    parser.add_argument('--progress-every', type=int, default=1000)
+    parser.add_argument('--progress', choices=('auto', 'bar', 'log', 'none'), default='auto',
+                        help='Live stderr progress: auto selects a terminal bar or timestamped logs.')
+    parser.add_argument('--no-progress', action='store_const', const='none', dest='progress',
+                        help='Disable progress output; errors and the final JSON remain enabled.')
+    parser.add_argument('--progress-interval', type=float, default=1.0,
+                        help='Seconds between heartbeat updates, including during slow I/O (default: 1).')
+    parser.add_argument('--progress-every', type=int, default=1000,
+                        help='Also report every N processed images (default: 1000). '
+                             'Image ETA excludes finalization; payload MiB/s is not disk bandwidth.')
     parser.add_argument('--dry-run', action='store_true',
                         help='Validate CSV and up to eight selected images; write nothing.')
     return parser
@@ -285,6 +440,9 @@ def main() -> None:
     args = parser.parse_args()
     try:
         summary = convert(args)
+    except KeyboardInterrupt:
+        parser.exit(130, 'Conversion interrupted. Any partial output without _SUCCESS is incomplete. '
+                         'Retry with a new output path; nothing is overwritten.\n')
     except ImportError as error:
         parser.exit(1, f'Missing/incompatible dependency: {error}. Use the Databricks ML Python '
                        'environment with mosaicml-streaming, Pillow and NumPy installed.\n')

@@ -1,12 +1,21 @@
 import csv
 import importlib.util
+import io
 import json
+import os
+import re
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
+from threading import Event
+from unittest.mock import patch
 
 from scripts.convert_to_mds import (
+    ProgressTracker,
     build_parser,
     convert,
     load_records,
@@ -114,6 +123,145 @@ class CSVTests(unittest.TestCase):
             list(ordered_parallel_map(delayed, range(5), 2, 1))
 
 
+class ProgressTests(unittest.TestCase):
+    def test_percentage_rate_eta_payload_and_idle_time(self):
+        stream = io.StringIO()
+        clock = unittest.mock.Mock(return_value=10.0)
+        with ProgressTracker(interval=60, stream=stream, clock=clock) as progress:
+            progress.set_stage('Converting images', total=4)
+            self.assertIn('image ETA --', stream.getvalue())
+            clock.return_value = 12.0
+            progress.advance(1024 * 1024)
+            progress.refresh()
+            line = stream.getvalue().splitlines()[-1]
+            for value in ['1/4 images', '25.0%', '0.5 images/s', 'image ETA 00:00:06',
+                          'elapsed 00:00:02', 'payload 1.0 MiB', '0.5 MiB/s']:
+                self.assertIn(value, line)
+            clock.return_value = 16.0
+            progress.refresh()
+            line = stream.getvalue().splitlines()[-1]
+            self.assertIn('image ETA 00:00:18', line)
+            self.assertIn('idle 00:00:04', line)
+            progress.set_stage('Finalizing shards')
+            self.assertIn('image ETA --', stream.getvalue().splitlines()[-1])
+        self.assertFalse(progress.thread.is_alive())
+
+    def test_initial_small_run_and_final_updates(self):
+        stream = io.StringIO()
+        with ProgressTracker(interval=60, stream=stream) as progress:
+            progress.set_stage('Converting images', total=1)
+            progress.advance(10)
+        text = stream.getvalue()
+        self.assertIn('Validating inputs', text)
+        self.assertIn('0/1 images', text)
+        self.assertIn('1/1 images (100.0%)', text)
+        self.assertIn('Complete', text.splitlines()[-1])
+        self.assertNotIn('\r', text)
+        self.assertNotIn('\x1b', text)
+
+    def test_heartbeat_updates_without_samples_or_stage_changes(self):
+        updated = Event()
+
+        class Stream(io.StringIO):
+            def write(self, text):
+                result = super().write(text)
+                if self.getvalue().count('Validating inputs') >= 2:
+                    updated.set()
+                return result
+
+        with ProgressTracker(interval=0.01, stream=Stream()) as progress:
+            self.assertTrue(updated.wait(2), 'No heartbeat while conversion is blocked')
+            self.assertEqual(progress.count, 0)
+        self.assertFalse(progress.thread.is_alive())
+
+    def test_failure_and_interrupt_do_not_report_success(self):
+        for error, label in [(ValueError('bad image'), 'Failed'),
+                             (KeyboardInterrupt(), 'Interrupted')]:
+            with self.subTest(label=label):
+                stream = io.StringIO()
+                with self.assertRaises(type(error)):
+                    with ProgressTracker(interval=60, stream=stream) as progress:
+                        progress.set_stage('Converting images', total=2)
+                        progress.advance(10)
+                        raise error
+                self.assertIn(f'{label} during Converting images', stream.getvalue())
+                self.assertIn('1/2 images', stream.getvalue())
+                self.assertNotIn('Complete', stream.getvalue())
+                self.assertFalse(progress.thread.is_alive())
+
+    def test_auto_bar_for_tty_and_explicit_log_mode(self):
+        for mode, bar in [('auto', True), ('log', False)]:
+            with self.subTest(mode=mode):
+                stream = io.StringIO()
+                stream.isatty = lambda: True
+                with ProgressTracker(interval=60, mode=mode, stream=stream) as progress:
+                    progress.set_stage('Converting images', total=4)
+                    progress.advance(10)
+                    progress.refresh()
+                self.assertEqual('\r' in stream.getvalue(), bar)
+                self.assertTrue(stream.getvalue().endswith('\n'))
+
+    def test_narrow_terminal_wraps_without_losing_metrics(self):
+        stream = io.StringIO()
+        with patch('scripts.convert_to_mds.shutil.get_terminal_size',
+                   return_value=os.terminal_size((60, 24))):
+            with ProgressTracker(interval=60, mode='bar', stream=stream) as progress:
+                progress.set_stage('Converting images', total=4)
+                stream.seek(0)
+                stream.truncate()
+                progress.advance(1024 * 1024)
+                progress.refresh()
+                frame = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', stream.getvalue())
+                self.assertTrue(all(len(line) < 60 for line in frame.splitlines()))
+                for value in ['1/4 images', 'image ETA', 'images/s', 'elapsed', 'payload', 'idle']:
+                    self.assertIn(value, frame)
+
+    def test_disabled_progress_has_no_output_or_thread(self):
+        stream = io.StringIO()
+        with ProgressTracker(mode='none', stream=stream) as progress:
+            progress.set_stage('Converting images', total=2)
+            progress.advance(10)
+        self.assertEqual(stream.getvalue(), '')
+        self.assertIsNone(progress.thread)
+
+    def test_sample_milestones_remain_supported(self):
+        stream = io.StringIO()
+        with ProgressTracker(interval=60, every=2, stream=stream) as progress:
+            progress.set_stage('Converting images', total=4)
+            before = stream.getvalue()
+            progress.advance(10)
+            self.assertEqual(stream.getvalue(), before)
+            progress.advance(10)
+            self.assertIn('2/4 images', stream.getvalue())
+
+    def test_broken_progress_stream_does_not_fail_work(self):
+        stream = unittest.mock.Mock()
+        stream.isatty.return_value = False
+        stream.write.side_effect = BrokenPipeError('closed')
+        with ProgressTracker(stream=stream) as progress:
+            progress.set_stage('Converting images', total=1)
+            progress.advance(10)
+
+    def test_invalid_intervals_and_sample_milestones(self):
+        for interval in [0, -1, float('nan'), float('inf')]:
+            with self.subTest(interval=interval):
+                with self.assertRaisesRegex(ValueError, 'progress-interval'):
+                    ProgressTracker(interval=interval)
+        with self.assertRaisesRegex(ValueError, 'progress-every'):
+            ProgressTracker(every=0)
+
+    def test_cli_progress_options(self):
+        parser = build_parser()
+        args = parser.parse_args(['--out', '/unused'])
+        self.assertEqual(args.progress, 'auto')
+        self.assertEqual(args.progress_interval, 1.0)
+        args = parser.parse_args(['--out', '/unused', '--progress', 'log',
+                                  '--progress-interval', '5', '--progress-every', '100'])
+        self.assertEqual((args.progress, args.progress_interval, args.progress_every),
+                         ('log', 5.0, 100))
+        self.assertEqual(parser.parse_args(['--out', '/unused', '--no-progress']).progress, 'none')
+
+
 @unittest.skipUnless(importlib.util.find_spec('streaming') and importlib.util.find_spec('PIL'),
                      'MDS integration tests require mosaicml-streaming and Pillow')
 class ConversionTests(unittest.TestCase):
@@ -150,8 +298,24 @@ class ConversionTests(unittest.TestCase):
         ])
 
     def test_bytes_roundtrip_and_success_manifest(self):
-        summary = convert(self.args())
+        stream = io.StringIO()
         output = self.root / 'output'
+        stages = []
+        set_stage = ProgressTracker.set_stage
+
+        def record_stage(progress, stage, **kwargs):
+            stages.append(stage)
+            if stage == 'Finalizing shards':
+                self.assertFalse((output / '_SUCCESS').exists())
+            return set_stage(progress, stage, **kwargs)
+
+        with redirect_stderr(stream), patch.object(ProgressTracker, 'set_stage', record_stage):
+            summary = convert(self.args())
+        self.assertIn('Validating CSV', stages)
+        self.assertIn('Finalizing shards', stages)
+        self.assertIn('Verifying output', stages)
+        self.assertIn('2/2 images (100.0%)', stream.getvalue())
+        self.assertIn('Complete', stream.getvalue().splitlines()[-1])
         dataset = self.LocalDataset(local=str(output))
         self.assertEqual(len(dataset), 2)
         for index in range(2):
@@ -190,11 +354,87 @@ class ConversionTests(unittest.TestCase):
         self.np.testing.assert_array_equal(dataset[0]['image'], self.pixels)
 
     def test_dry_run_and_limit(self):
-        summary = convert(self.args('preview', '--dry-run', '--limit', '1'))
+        stream = io.StringIO()
+        with redirect_stderr(stream):
+            summary = convert(self.args('preview', '--dry-run', '--limit', '1'))
         self.assertEqual(summary['samples'], 1)
         self.assertEqual(summary['csv_rows'], 2)
         self.assertEqual(summary['images_checked'], 1)
         self.assertFalse((self.root / 'preview').exists())
+        self.assertIn('1/1 images', stream.getvalue())
+        self.assertIn('Dry run complete (no output written)', stream.getvalue())
+        self.assertNotIn('Finalizing shards', stream.getvalue())
+
+    def test_cli_keeps_stdout_json_and_can_disable_progress(self):
+        for mode in ['log', 'none']:
+            with self.subTest(mode=mode):
+                args = self.args(f'cli-{mode}', '--dry-run')
+                result = subprocess.run([
+                    sys.executable, '-B', '-m', 'scripts.convert_to_mds',
+                    '--csv', str(args.csv), '--images-dir', str(args.images_dir),
+                    '--out', str(args.out), '--dry-run', '--progress', mode,
+                ], text=True, capture_output=True, check=True)
+                self.assertTrue(json.loads(result.stdout)['dry_run'])
+                if mode == 'none':
+                    self.assertEqual(result.stderr, '')
+                else:
+                    self.assertIn('Dry run complete', result.stderr)
+                    self.assertNotIn('\r', result.stderr)
+
+    def test_finalization_failure_never_reports_complete(self):
+        from streaming import MDSWriter
+
+        stream = io.StringIO()
+        with redirect_stderr(stream), patch.object(MDSWriter, 'finish',
+                                                   side_effect=OSError('flush failed')):
+            with self.assertRaisesRegex(OSError, 'flush failed'):
+                convert(self.args())
+        self.assertIn('Failed during Finalizing shards', stream.getvalue())
+        self.assertNotIn('Complete', stream.getvalue())
+        self.assertFalse((self.root / 'output' / '_SUCCESS').exists())
+
+    def test_heartbeat_during_writer_finalization(self):
+        from streaming import MDSWriter
+
+        heartbeat = Event()
+        finish = MDSWriter.finish
+
+        class Stream(io.StringIO):
+            def write(self, text):
+                result = super().write(text)
+                if self.getvalue().count('Finalizing shards') >= 2:
+                    heartbeat.set()
+                return result
+
+        def slow_finish(writer):
+            self.assertTrue(heartbeat.wait(2), 'No heartbeat while the writer is finalizing')
+            return finish(writer)
+
+        with redirect_stderr(Stream()), patch.object(MDSWriter, 'finish', slow_finish):
+            convert(self.args('output', '--progress-interval', '0.01'))
+        self.assertTrue((self.root / 'output' / '_SUCCESS').exists())
+
+    def test_failed_write_is_not_counted_as_processed(self):
+        from streaming import MDSWriter
+
+        stream = io.StringIO()
+        with redirect_stderr(stream), patch.object(MDSWriter, 'write',
+                                                   side_effect=OSError('write failed')):
+            with self.assertRaisesRegex(OSError, 'write failed'):
+                convert(self.args())
+        self.assertIn('Failed during Converting images | 0/2 images', stream.getvalue())
+        self.assertNotIn('Complete', stream.getvalue())
+        self.assertFalse((self.root / 'output' / '_SUCCESS').exists())
+
+    def test_verification_failure_never_reports_complete(self):
+        stream = io.StringIO()
+        with redirect_stderr(stream), patch('scripts.convert_to_mds.json.loads',
+                                            return_value={'shards': [{'samples': 0}]}):
+            with self.assertRaisesRegex(RuntimeError, 'sample count'):
+                convert(self.args())
+        self.assertIn('Failed during Verifying output', stream.getvalue())
+        self.assertNotIn('Complete', stream.getvalue())
+        self.assertFalse((self.root / 'output' / '_SUCCESS').exists())
 
     def test_existing_output_untouched(self):
         output = self.root / 'output'
@@ -244,7 +484,10 @@ class ConversionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'oversized'):
             load_sample(records[0], 'bytes', 1)
         for options in [('--workers', '0'), ('--prefetch', '1'), ('--limit', '0'),
-                        ('--shard-size-mb', '4096'), ('--max-sample-mb', '0')]:
+                        ('--shard-size-mb', '4096'), ('--max-sample-mb', '0'),
+                        ('--progress-every', '0'), ('--progress-interval', '0'),
+                        ('--progress-interval', 'nan'), ('--progress-interval', 'inf'),
+                        ('--progress-interval', '1e30')]:
             with self.subTest(options=options):
                 with self.assertRaises(ValueError):
                     convert(self.args('invalid', *options))

@@ -197,6 +197,20 @@ python scripts/convert_to_mds.py \
 
 Use `--image-pattern '{patient_id}/{image_id}.png'` for a different nested PNG layout. Single-frame PNG, JPEG, and TIFF are accepted; original DICOM conversion is not implemented. Images are never resized, cropped, normalized, or converted to lossy JPEG by this script. Train-only metadata is preserved as metadata, not automatically fed into a model.
 
+### Live conversion progress
+
+Progress is enabled by default on **stderr**, leaving the final JSON summary on stdout unchanged. `--progress auto` selects an updating terminal bar when stderr is a terminal, or timestamped, newline-delimited logs in Databricks notebooks, redirected output, and job logs. Terminal output wraps to keep the metrics visible on narrow screens; use `--progress log` if your console does not support cursor controls.
+
+The tracker shows the current stage, processed/selected images, percentage, average images/sec, elapsed time, estimated remaining image-processing time, logical image-payload MiB and MiB/sec, and time since the last processed image or stage change (`idle`). A background heartbeat updates even while the main thread waits on image reads or shard writes. An increasing idle time signals no newly completed sample/stage, not proof of a deadlock; it does not cancel slow storage operations.
+
+- `--progress-interval 1`: seconds between heartbeat updates (default: 1; must be finite and positive).
+- `--progress-every 1000`: additional updates at image-count milestones, retained for compatibility. Startup, stage transitions, the final image, and success/failure are always reported when progress is enabled, including runs smaller than this count.
+- `--progress log --progress-interval 5`: less frequent, notebook/job-friendly heartbeat logs.
+- `--progress bar`: explicitly select the live terminal display.
+- `--no-progress` or `--progress none`: suppress progress only; errors and the final JSON summary remain enabled.
+
+**ETA is an estimate for the remaining images, not a completion guarantee.** It uses average processing throughput and is unknown (`--`) until there is a measured rate. During final shard flushing, index verification, and manifest publication, ETA returns to unknown while the heartbeat and elapsed timer continue. Payload throughput is not physical disk/network bandwidth, and processed images may still be buffered by the MDS writer: **100% images does not mean the dataset is ready**. `Complete` is reported only after verification and creation of `_SUCCESS`. Dry runs count only the up-to-eight checked images and explicitly report that no output was written. Failures/interruption report their stage and processed count without declaring completion; Ctrl-C exits with status 130 after cleanup.
+
 ### Storage choices
 
 | Setting | Stored image representation | When to try it |
