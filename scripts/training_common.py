@@ -294,6 +294,18 @@ def build_parser(approach):
     parser.add_argument('--max-train-batches', type=int,
                         help='Debug-only training batch limit per epoch; validation still covers the full fold.')
     parser.add_argument('--no-progress', action='store_true')
+    parser.add_argument('--wandb', action='store_true',
+                        help='Log metrics, config, and system stats to Weights & Biases (primary rank only).')
+    parser.add_argument('--wandb-project', default='rsna-breast-cancer',
+                        help='Weights & Biases project name; used only with --wandb.')
+    parser.add_argument('--wandb-entity', default=None,
+                        help='Weights & Biases entity (team or user); defaults to your logged-in default.')
+    parser.add_argument('--wandb-run-name', default=None,
+                        help='Weights & Biases run name; defaults to the output directory name.')
+    parser.add_argument('--wandb-mode', choices=('online', 'offline', 'disabled'), default='online',
+                        help='Weights & Biases mode; offline records locally to sync later with wandb sync.')
+    parser.add_argument('--wandb-tags', nargs='*', default=[], metavar='TAG',
+                        help='Optional Weights & Biases run tags.')
     return parser
 
 
@@ -346,6 +358,39 @@ def resolve_device(args, cluster):
         device = torch.device('cuda', index)
         torch.cuda.set_device(device)
     return device
+
+
+def _wandb_init(args, approach, config, cluster):
+    if not args.wandb or not cluster.primary:
+        return None
+    try:
+        import wandb
+    except ImportError as error:
+        raise ImportError('wandb is unavailable; install it with pip install wandb or omit --wandb.') from error
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name or args.out.name,
+        mode=args.wandb_mode,
+        tags=args.wandb_tags or None,
+        config=config,
+    )
+
+
+def _wandb_log_epoch(run, result, best_score):
+    if run is None:
+        return
+    metrics = {
+        'lr': result['lr'],
+        'train/loss': result['train_loss'],
+        'train/samples': result['train_samples'],
+        'train/optimizer_steps': result['optimizer_steps'],
+        'val/loss': result['validation_loss'],
+        'val/best_pf1': best_score,
+        'epoch/elapsed_seconds': result['elapsed_seconds'],
+    }
+    metrics.update({f'val/{key}': value for key, value in result['validation'].items()})
+    run.log(metrics, step=result['epoch'])
 
 
 def train(args, approach):
@@ -452,6 +497,7 @@ def _train(args, approach, cluster, device):
         'constant_prevalence_pf1': pf1(val_truth.values(), [prevalence] * len(val_truth)),
         'validation_weights': 'ema' if ema_model is not None else 'model',
     }
+    run = None
     cluster.barrier()
     if cluster.primary:
         output.mkdir(exist_ok=False)
@@ -467,6 +513,7 @@ def _train(args, approach, cluster, device):
             writer.writerow(['prediction_id', 'cancer'])
             writer.writerows(val_truth.items())
         print(json.dumps({'event': 'setup', **config}, allow_nan=False), flush=True)
+        run = _wandb_init(args, approach, config, cluster)
     best_score = -math.inf
     history = []
     for epoch in range(1, args.epochs + 1):
@@ -529,12 +576,16 @@ def _train(args, approach, cluster, device):
                 for row in history:
                     file.write(json.dumps(row, allow_nan=False) + '\n')
             print(json.dumps({'event': 'epoch', **result}, allow_nan=False), flush=True)
+            _wandb_log_epoch(run, result, best_score)
         cluster.barrier()
     if cluster.primary:
         with (output / '_TRAINING_SUCCESS').open('x', encoding='utf-8') as file:
             json.dump({'epochs': args.epochs, 'best_pf1': best_score, 'world_size': cluster.world_size},
                       file, allow_nan=False)
             file.write('\n')
+        if run is not None:
+            run.summary['best_pf1'] = best_score
+            run.finish()
     return history
 
 

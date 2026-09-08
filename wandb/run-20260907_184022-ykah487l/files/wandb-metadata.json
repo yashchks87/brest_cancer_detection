@@ -1,0 +1,92 @@
+{
+  "os":  "Linux-5.15.0-1113-aws-x86_64-with-glibc2.39",
+  "python":  "CPython 3.12.3",
+  "startedAt":  "2026-09-07T18:40:22.480419Z",
+  "args":  [
+    "--cache",
+    "/tmp/vit_cache",
+    "--out",
+    "/Volumes/daai_ke_team/default/images/cancer_dataset/runs/vit_lr2e5_pw3_img512_drop035_e24",
+    "--batch-size",
+    "8",
+    "--grad-accum",
+    "1",
+    "--lr",
+    "2e-5",
+    "--pos-weight",
+    "3",
+    "--image-size",
+    "512",
+    "--dropout",
+    "0.35",
+    "--epochs",
+    "24",
+    "--wandb",
+    "--wandb-entity",
+    "yashchks87",
+    "--wandb-project",
+    "Brest-Cancer-Experiments",
+    "--wandb-tags",
+    "vit",
+    "img512",
+    "pw3",
+    "dropout035",
+    "e24"
+  ],
+  "program":  "/root/brest_cancer_detection/scripts/train_vit.py",
+  "codePath":  "scripts/train_vit.py",
+  "codePathLocal":  "scripts/train_vit.py",
+  "git":  {
+    "remote":  "https://github.com/yashchks87/brest_cancer_detection.git",
+    "commit":  "871f5fd5d6d2088dde8b65a988dc5cfe7931d6c6"
+  },
+  "email":  "yashchks87@gmail.com",
+  "root":  "/root/brest_cancer_detection",
+  "host":  "0805-233233-pauecpaj-10-1-38-124",
+  "executable":  "/root/brest_cancer_detection/venv/bin/python3.12",
+  "cpu_count":  24,
+  "cpu_count_logical":  48,
+  "gpu":  "NVIDIA A10G",
+  "gpu_count":  4,
+  "disk":  {
+    "/":  {
+      "total":  "157396975616",
+      "used":  "69961318400"
+    }
+  },
+  "memory":  {
+    "total":  "194940764160"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA A10G",
+      "memoryTotal":  "24146608128",
+      "cudaCores":  10240,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-d08a5047-dc15-97c7-f0eb-3583ee4ac4c0"
+    },
+    {
+      "name":  "NVIDIA A10G",
+      "memoryTotal":  "24146608128",
+      "cudaCores":  10240,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-76d48c61-9a21-f73e-9d36-056eb5c1f416"
+    },
+    {
+      "name":  "NVIDIA A10G",
+      "memoryTotal":  "24146608128",
+      "cudaCores":  10240,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-dd86cd37-83b6-411d-6844-4ae5dbd56136"
+    },
+    {
+      "name":  "NVIDIA A10G",
+      "memoryTotal":  "24146608128",
+      "cudaCores":  10240,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-e478e8d6-e09b-c9b8-7888-6fa6d90ef87d"
+    }
+  ],
+  "cudaVersion":  "13.0",
+  "writerId":  "xlk4mcvy5tsjvtkpryniuq7zohpsltg8"
+}

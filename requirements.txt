@@ -38,4 +38,5 @@ torch==2.14.0
 torchvision==0.29.0
 triton==3.8.0
 typing_extensions==4.16.0
+wandb==0.29.0
 wcwidth==0.8.3

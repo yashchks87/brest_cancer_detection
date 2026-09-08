@@ -1,0 +1,192 @@
+_wandb:
+    value:
+        cli_version: 0.29.0
+        e:
+            xlk4mcvy5tsjvtkpryniuq7zohpsltg8:
+                args:
+                    - --cache
+                    - /tmp/vit_cache
+                    - --out
+                    - /Volumes/daai_ke_team/default/images/cancer_dataset/runs/vit_lr2e5_pw3_img512_drop035_e24
+                    - --batch-size
+                    - "8"
+                    - --grad-accum
+                    - "1"
+                    - --lr
+                    - "2e-5"
+                    - --pos-weight
+                    - "3"
+                    - --image-size
+                    - "512"
+                    - --dropout
+                    - "0.35"
+                    - --epochs
+                    - "24"
+                    - --wandb
+                    - --wandb-entity
+                    - yashchks87
+                    - --wandb-project
+                    - Brest-Cancer-Experiments
+                    - --wandb-tags
+                    - vit
+                    - img512
+                    - pw3
+                    - dropout035
+                    - e24
+                codePath: scripts/train_vit.py
+                codePathLocal: scripts/train_vit.py
+                cpu_count: 24
+                cpu_count_logical: 48
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "157396975616"
+                        used: "69961318400"
+                email: yashchks87@gmail.com
+                executable: /root/brest_cancer_detection/venv/bin/python3.12
+                git:
+                    commit: 871f5fd5d6d2088dde8b65a988dc5cfe7931d6c6
+                    remote: https://github.com/yashchks87/brest_cancer_detection.git
+                gpu: NVIDIA A10G
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10240
+                      memoryTotal: "24146608128"
+                      name: NVIDIA A10G
+                      uuid: GPU-d08a5047-dc15-97c7-f0eb-3583ee4ac4c0
+                    - architecture: Ampere
+                      cudaCores: 10240
+                      memoryTotal: "24146608128"
+                      name: NVIDIA A10G
+                      uuid: GPU-76d48c61-9a21-f73e-9d36-056eb5c1f416
+                    - architecture: Ampere
+                      cudaCores: 10240
+                      memoryTotal: "24146608128"
+                      name: NVIDIA A10G
+                      uuid: GPU-dd86cd37-83b6-411d-6844-4ae5dbd56136
+                    - architecture: Ampere
+                      cudaCores: 10240
+                      memoryTotal: "24146608128"
+                      name: NVIDIA A10G
+                      uuid: GPU-e478e8d6-e09b-c9b8-7888-6fa6d90ef87d
+                host: 0805-233233-pauecpaj-10-1-38-124
+                memory:
+                    total: "194940764160"
+                os: Linux-5.15.0-1113-aws-x86_64-with-glibc2.39
+                program: /root/brest_cancer_detection/scripts/train_vit.py
+                python: CPython 3.12.3
+                root: /root/brest_cancer_detection
+                startedAt: "2026-09-07T18:40:22.480419Z"
+                writerId: xlk4mcvy5tsjvtkpryniuq7zohpsltg8
+        m: []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+                - 11
+                - 41
+                - 49
+            "2":
+                - 1
+                - 11
+                - 41
+                - 49
+            "3":
+                - 2
+                - 13
+                - 15
+                - 16
+                - 62
+                - 61
+            "4": 3.12.3
+            "5": 0.29.0
+            "6": 4.57.6
+            "12": 0.29.0
+            "13": linux-x86_64
+amp_dtype:
+    value: torch.bfloat16
+approach:
+    value: vit
+arguments:
+    value:
+        amp: true
+        batch_size: 8
+        cache: /tmp/vit_cache
+        cache_limit: 20gb
+        clip_grad: 1
+        csv: null
+        device: auto
+        dropout: 0.35
+        ema_decay: 0.999
+        epochs: 24
+        exclude_folds: []
+        fold: 0
+        folds: 5
+        grad_accum: 1
+        image_size: 512
+        intensity_max: null
+        lr: 2e-05
+        max_train_batches: null
+        max_views: 2
+        mds: /Volumes/daai_ke_team/default/images/cancer_dataset/shrads/cancer_dataset_mds_v3
+        no_progress: false
+        num_workers: 2
+        out: /Volumes/daai_ke_team/default/images/cancer_dataset/runs/vit_lr2e5_pw3_img512_drop035_e24
+        pooling: mean
+        pos_weight: "3"
+        pretrained: true
+        save_epochs: true
+        seed: 42
+        view_chunk_size: 2
+        wandb: true
+        wandb_entity: yashchks87
+        wandb_mode: online
+        wandb_project: Brest-Cancer-Experiments
+        wandb_run_name: null
+        wandb_tags:
+            - vit
+            - img512
+            - pw3
+            - dropout035
+            - e24
+        weight_decay: 0.05
+constant_prevalence_pf1:
+    value: 0.0208442746729738
+dataset:
+    value:
+        csv_sha256: 35408731b67b87272f85874ee3c4c9d5cea7a2c4fbcaeac3fbe415ba1a5817c1
+        index_sha256: b9c37853d304166361a1832033633498d69c530af0d620b5131fdb081b6aae2f
+        path: /Volumes/daai_ke_team/default/images/cancer_dataset/shrads/cancer_dataset_mds_v3
+        samples: 54687
+        skipped_missing_images: 19
+device:
+    value: cuda:0
+effective_batch_breasts_or_images:
+    value: 32
+excluded_folds:
+    value: []
+excluded_images:
+    value: 0
+excluded_patients:
+    value: 0
+positive_loss_weight:
+    value: 3
+torch_version:
+    value: 2.14.0+cu130
+train_breasts:
+    value: 19058
+train_images:
+    value: 43673
+train_positive_breasts:
+    value: 391
+validation_breasts:
+    value: 4768
+validation_images:
+    value: 11014
+validation_positive_breasts:
+    value: 101
+validation_weights:
+    value: ema
+world_size:
+    value: 4
