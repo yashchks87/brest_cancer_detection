@@ -1,0 +1,24 @@
+2026-09-08 19:52:40,320 INFO    MainThread:50254 [wandb_setup.py:_flush():81] Current SDK version is 0.29.0
+2026-09-08 19:52:40,320 INFO    MainThread:50254 [wandb_setup.py:_flush():81] Configure stats pid to 50254
+2026-09-08 19:52:40,320 INFO    MainThread:50254 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-09-08 19:52:40,321 INFO    MainThread:50254 [wandb_init.py:setup_run_log_directory():739] Logging user logs to /root/brest_cancer_detection/wandb/run-20260908_195240-rk18sz2p/logs/debug.log
+2026-09-08 19:52:40,321 INFO    MainThread:50254 [wandb_init.py:setup_run_log_directory():740] Logging internal logs to /root/brest_cancer_detection/wandb/run-20260908_195240-rk18sz2p/logs/debug-internal.log
+2026-09-08 19:52:40,321 INFO    MainThread:50254 [wandb_init.py:init():783] calling init triggers
+2026-09-08 19:52:40,321 INFO    MainThread:50254 [wandb_init.py:init():788] wandb.init called with sweep_config: {}
+config: {'approach': 'advanced', 'arguments': {'mds': '/Volumes/daai_ke_team/default/images/cancer_dataset/shrads/cancer_dataset_mds_v3', 'csv': None, 'cache': '/tmp/cnn_cache', 'out': '/Volumes/daai_ke_team/default/images/cancer_dataset/runs/cnn_convnext_lr1e4_pw3_img512_drop035_e14', 'epochs': 14, 'image_size': 512, 'batch_size': 8, 'grad_accum': 1, 'lr': 0.0001, 'weight_decay': 0.05, 'dropout': 0.35, 'pos_weight': '3', 'clip_grad': 1.0, 'folds': 5, 'fold': 0, 'exclude_folds': [], 'seed': 42, 'num_workers': 2, 'cache_limit': '20gb', 'max_views': 2, 'view_chunk_size': 2, 'intensity_max': None, 'pooling': 'mean', 'encoder': 'convnext_tiny', 'pretrained': True, 'amp': True, 'ema_decay': 0.999, 'device': 'auto', 'save_epochs': True, 'max_train_batches': None, 'no_progress': True, 'wandb': True, 'wandb_project': 'Brest-Cancer-Experiments', 'wandb_entity': 'yashchks87', 'wandb_run_name': None, 'wandb_mode': 'online', 'wandb_tags': ['cnn', 'convnext_tiny', 'img512', 'pw3', 'dropout035', 'e14']}, 'dataset': {'path': '/Volumes/daai_ke_team/default/images/cancer_dataset/shrads/cancer_dataset_mds_v3', 'index_sha256': 'b9c37853d304166361a1832033633498d69c530af0d620b5131fdb081b6aae2f', 'csv_sha256': '35408731b67b87272f85874ee3c4c9d5cea7a2c4fbcaeac3fbe415ba1a5817c1', 'samples': 54687, 'skipped_missing_images': 19}, 'torch_version': '2.14.0+cu130', 'positive_loss_weight': 3.0, 'device': 'cuda:0', 'world_size': 4, 'effective_batch_breasts_or_images': 32, 'amp_dtype': 'torch.bfloat16', 'excluded_folds': [], 'excluded_patients': 0, 'excluded_images': 0, 'train_images': 43673, 'validation_images': 11014, 'train_breasts': 19058, 'validation_breasts': 4768, 'train_positive_breasts': 391, 'validation_positive_breasts': 101, 'constant_prevalence_pf1': 0.0208442746729738, 'validation_weights': 'ema', '_wandb': {}}
+2026-09-08 19:52:40,321 INFO    MainThread:50254 [wandb_init.py:init():831] starting backend
+2026-09-08 19:52:40,321 INFO    MainThread:50254 [wandb_init.py:init():846] sending inform_init request
+2026-09-08 19:52:41,245 INFO    MainThread:50254 [wandb_init.py:init():851] backend started and connected
+2026-09-08 19:52:41,246 INFO    MainThread:50254 [wandb_init.py:init():921] updated telemetry
+2026-09-08 19:52:41,313 INFO    MainThread:50254 [wandb_init.py:init():944] communicating run to backend with 90.0 second timeout
+2026-09-08 19:52:41,992 INFO    MainThread:50254 [wandb_init.py:init():981] starting run threads in backend
+2026-09-08 19:52:42,102 INFO    MainThread:50254 [wandb_run.py:_console_start():2545] atexit reg
+2026-09-08 19:52:42,102 INFO    MainThread:50254 [wandb_run.py:_redirect():2395] redirect: wrap_raw
+2026-09-08 19:52:42,102 INFO    MainThread:50254 [wandb_run.py:_redirect():2464] Wrapping output streams.
+2026-09-08 19:52:42,102 INFO    MainThread:50254 [wandb_run.py:_redirect():2487] Redirects installed.
+2026-09-08 19:52:42,104 INFO    MainThread:50254 [wandb_init.py:init():1019] run started, returning control to user process
+2026-09-08 20:40:23,628 INFO    MainThread:50254 [wandb_run.py:_finish():2316] finishing run yashchks87/Brest-Cancer-Experiments/rk18sz2p
+2026-09-08 20:40:23,628 INFO    MainThread:50254 [wandb_run.py:_atexit_cleanup():2512] got exitcode: 0
+2026-09-08 20:40:23,629 INFO    MainThread:50254 [wandb_run.py:_restore():2494] restore
+2026-09-08 20:40:23,629 INFO    MainThread:50254 [wandb_run.py:_restore():2500] restore done
+2026-09-08 20:40:25,142 INFO    MainThread:50254 [wandb_run.py:_footer_sync_info():3917] logging synced files
