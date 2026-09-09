@@ -24,13 +24,17 @@ from torch.utils.data import DataLoader
 from scripts.benchmark_mds import RSNAStreamingDataset
 from scripts.convert_to_mds import build_parser, convert
 from scripts.training_data import (
+    BalancedDistributedSampler,
     BreastDataset,
     ImageDataset,
     ImageTransform,
     TrainingRecord,
     collate_samples,
+    expand_box,
     load_training_records,
     patient_fold_assignments,
+    read_roi_boxes,
+    roi_bounding_box,
 )
 
 
@@ -44,14 +48,15 @@ class MetadataTests(unittest.TestCase):
         self.remote = self.root / 'mds'
         self.remote.mkdir()
         self.rows = [
-            ['1', '10', 'L', 'CC', '1'], ['1', '11', 'L', 'MLO', '1'],
-            ['1', '12', 'R', 'CC', '0'], ['2', '20', 'L', 'CC', '0'],
-            ['2', '21', 'L', 'MLO', '0'], ['3', '30', 'R', 'CC', '1'],
-            ['4', '40', 'L', 'CC', '0'], ['5', '50', 'R', 'CC', '0'],
+            ['1', '10', 'L', 'CC', '1', '1', 'True'], ['1', '11', 'L', 'MLO', '1', '1', 'True'],
+            ['1', '12', 'R', 'CC', '0', '1', 'False'], ['2', '20', 'L', 'CC', '0', '0', 'False'],
+            ['2', '21', 'L', 'MLO', '0', '0', ''], ['3', '30', 'R', 'CC', '1', '1', 'True'],
+            ['4', '40', 'L', 'CC', '0', '0', 'False'], ['5', '50', 'R', 'CC', '0', '0', 'False'],
         ]
         with self.csv_path.open('w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(['patient_id', 'image_id', 'laterality', 'view', 'cancer'])
+            writer.writerow(['patient_id', 'image_id', 'laterality', 'view', 'cancer', 'biopsy',
+                             'difficult_negative_case'])
             writer.writerows(self.rows)
         index = json.dumps({'shards': [{'samples': 5}]}).encode()
         (self.remote / 'index.json').write_bytes(index)
@@ -94,7 +99,7 @@ class MetadataTests(unittest.TestCase):
         expected = [row for row in expected if row[1] != '11']
         self.assertEqual(manifest, self.manifest)
         self.assertEqual(records, [TrainingRecord(i, f'{row[0]}_{row[1]}', row[0],
-                                                  f'{row[0]}_{row[2]}', int(row[4]))
+                                                  f'{row[0]}_{row[2]}', int(row[4]), row[2])
                                    for i, row in enumerate(expected)])
         with self.assertRaises(FrozenInstanceError):
             records[0].index = 10
@@ -183,6 +188,163 @@ class MetadataTests(unittest.TestCase):
         (self.remote / '_SUCCESS').unlink()
         with self.assertRaisesRegex(ValueError, 'Incomplete'):
             load_training_records(self.remote)
+
+    def test_auxiliary_targets_are_read_and_validated(self):
+        _, plain = load_training_records(self.remote)
+        self.assertTrue(all(record.aux == () for record in plain))
+        _, records = load_training_records(self.remote, aux_targets=('biopsy',))
+        by_sample = {record.sample_id: record for record in records}
+        self.assertEqual(by_sample['1_10'].aux, (1.0,))
+        self.assertEqual(by_sample['2_20'].aux, (0.0,))
+        self.assertEqual(by_sample['1_10'].laterality, 'L')
+        _, pair = load_training_records(self.remote, aux_targets=('biopsy', 'cancer'))
+        self.assertEqual({record.sample_id: record.aux for record in pair}['3_30'], (1.0, 1.0))
+        with self.assertRaisesRegex(ValueError, 'not a column'):
+            load_training_records(self.remote, aux_targets=('nonexistent',))
+        # 2_21 carries a blank difficult_negative_case, which must be rejected loudly.
+        with self.assertRaisesRegex(ValueError, 'must be binary'):
+            load_training_records(self.remote, aux_targets=('difficult_negative_case',))
+
+
+class RoiTests(unittest.TestCase):
+    @staticmethod
+    def frame(box=(20, 30, 60, 90), size=(120, 100), value=200):
+        """Dark frame with one bright rectangle at (x0, y0, x1, y1)."""
+        pixels = np.zeros((size[1], size[0]), dtype=np.uint8)
+        pixels[box[1]:box[3], box[0]:box[2]] = value
+        return pixels
+
+    def test_finds_the_blob_and_ignores_disconnected_speckle(self):
+        pixels = self.frame()
+        self.assertEqual(roi_bounding_box(pixels, analysis_size=256), (20, 30, 60, 90))
+        pixels[5:8, 100:104] = 255  # a burned-in annotation far from the breast
+        self.assertEqual(roi_bounding_box(pixels, analysis_size=256), (20, 30, 60, 90))
+
+    def test_falls_back_to_the_full_frame_rather_than_deleting_anatomy(self):
+        blank = np.zeros((40, 50), dtype=np.uint8)
+        self.assertEqual(roi_bounding_box(blank), (0, 0, 50, 40))
+        speck = np.zeros((40, 50), dtype=np.uint8)
+        speck[0, 0] = 255
+        self.assertEqual(roi_bounding_box(speck, min_area_fraction=0.5), (0, 0, 50, 40))
+        self.assertEqual(roi_bounding_box(np.full((8, 9), 255, dtype=np.uint8)), (0, 0, 9, 8))
+
+    def test_rgb_and_downsampled_analysis_agree_with_grayscale(self):
+        pixels = self.frame(size=(1200, 1000), box=(200, 300, 600, 900))
+        box = roi_bounding_box(pixels)
+        self.assertEqual(box[0] // 8, 200 // 8)
+        self.assertLessEqual(abs(box[2] - 600), 8)
+        rgb = np.repeat(pixels[:, :, None], 3, axis=2)
+        self.assertEqual(roi_bounding_box(rgb), box)
+
+    def test_invalid_arguments_rejected(self):
+        for kwargs in ({'threshold': 0.0}, {'threshold': 1.0}, {'min_area_fraction': 1.0},
+                       {'analysis_size': 8}, {'analysis_size': 64.0}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                roi_bounding_box(self.frame(), **kwargs)
+        with self.assertRaises(ValueError):
+            roi_bounding_box([[1, 2], [3, 4]])
+
+    def test_margin_expands_and_clamps(self):
+        self.assertEqual(expand_box((20, 30, 60, 90), 120, 100, 0.0), (20, 30, 60, 90))
+        self.assertEqual(expand_box((20, 30, 60, 90), 120, 100, 0.25), (10, 15, 70, 100))
+        self.assertEqual(expand_box((0, 0, 10, 10), 12, 12, 5.0), (0, 0, 12, 12))
+        with self.assertRaises(ValueError):
+            expand_box((0, 0, 5, 5), 10, 10, -0.1)
+
+    def test_crop_magnifies_and_canonical_side_flips_by_geometry(self):
+        left = self.frame(box=(0, 20, 30, 80), size=(120, 100))
+        right = np.ascontiguousarray(left[:, ::-1])
+        plain = ImageTransform(32)(left)
+        cropped = ImageTransform(32, roi_crop=True, roi_margin=0.0)(left)
+        self.assertFalse(torch.equal(plain, cropped))
+        # The whole canvas is breast after cropping, so far fewer padded background pixels.
+        self.assertGreater((cropped > cropped.min()).float().mean(),
+                           (plain > plain.min()).float().mean())
+        canonical = ImageTransform(32, roi_crop=True, roi_margin=0.0, canonical_side='left')
+        torch.testing.assert_close(canonical(left), canonical(right))
+        mirrored = ImageTransform(32, roi_crop=True, roi_margin=0.0, canonical_side='right')
+        torch.testing.assert_close(mirrored(left), torch.flip(canonical(left), dims=[-1]))
+
+    def test_supplied_boxes_are_used_and_validated(self):
+        pixels = self.frame()
+        transform = ImageTransform(16, roi_crop=True, roi_margin=0.0)
+        torch.testing.assert_close(transform(pixels, (20, 30, 60, 90)), transform(pixels))
+        for box in ((-1, 0, 10, 10), (0, 0, 999, 10), (10, 0, 10, 10)):
+            with self.subTest(box=box), self.assertRaises(ValueError):
+                transform(pixels, box)
+
+    def test_disabled_by_default_so_existing_runs_are_unchanged(self):
+        pixels = self.frame()
+        transform = ImageTransform(16)
+        self.assertFalse(transform.roi_crop)
+        self.assertIsNone(transform.canonical_side)
+        with patch('scripts.training_data.roi_bounding_box') as detector:
+            transform(pixels)
+        detector.assert_not_called()
+
+    def test_transform_rejects_invalid_roi_settings(self):
+        for kwargs in ({'roi_crop': 'yes'}, {'roi_margin': -1.0}, {'roi_margin': float('inf')},
+                       {'canonical_side': 'middle'}):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                ImageTransform(16, **kwargs)
+
+    def test_box_csv_roundtrip_and_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'boxes.csv'
+            path.write_text('sample_id,x0,y0,x1,y1\na,1,2,3,4\nb,0,0,10,10\n')
+            self.assertEqual(read_roi_boxes(path), {'a': (1, 2, 3, 4), 'b': (0, 0, 10, 10)})
+            for content, message in (
+                ('sample_id,x0,y0\na,1,2\n', 'columns'),
+                ('sample_id,x0,y0,x1,y1\na,1,2,3,4\na,1,2,3,4\n', 'Duplicate'),
+                ('sample_id,x0,y0,x1,y1\na,1,2,1,4\n', 'empty or negative'),
+                ('sample_id,x0,y0,x1,y1\n', 'no rows'),
+            ):
+                path.write_text(content)
+                with self.subTest(content=content), self.assertRaisesRegex(ValueError, message):
+                    read_roi_boxes(path)
+
+
+class BalancedSamplerTests(unittest.TestCase):
+    def setUp(self):
+        self.targets = [1] * 20 + [0] * 980
+
+    def test_hits_the_requested_positive_fraction(self):
+        sampler = BalancedDistributedSampler(self.targets, 0.25, seed=7)
+        indices = list(sampler)
+        self.assertEqual(len(indices), 1000)
+        positives = sum(self.targets[index] for index in indices)
+        self.assertEqual(positives, 250)
+        natural = BalancedDistributedSampler(self.targets, 0.02, seed=7)
+        self.assertEqual(sum(self.targets[index] for index in natural), 20)
+
+    def test_ranks_partition_the_epoch_identically_across_processes(self):
+        def epoch_indices(rank, epoch):
+            sampler = BalancedDistributedSampler(self.targets, 0.2, num_replicas=4, rank=rank, seed=3)
+            sampler.set_epoch(epoch)
+            return list(sampler)
+
+        shards = [epoch_indices(rank, 1) for rank in range(4)]
+        self.assertEqual([len(shard) for shard in shards], [250] * 4)
+        self.assertEqual(sorted(index for shard in shards for index in shard),
+                         sorted(epoch_indices(0, 1) + epoch_indices(1, 1)
+                                + epoch_indices(2, 1) + epoch_indices(3, 1)))
+        for rank in range(4):
+            self.assertEqual(shards[rank], epoch_indices(rank, 1))
+            self.assertNotEqual(shards[rank], epoch_indices(rank, 2))
+
+    def test_negatives_are_drawn_without_replacement_within_an_epoch(self):
+        sampler = BalancedDistributedSampler(self.targets, 0.2, seed=11)
+        indices = list(sampler)
+        negatives = [index for index in indices if self.targets[index] == 0]
+        self.assertEqual(len(negatives), len(set(negatives)))
+
+    def test_invalid_arguments_rejected(self):
+        for args, kwargs in (((self.targets, 0.0), {}), ((self.targets, 1.0), {}),
+                             ((self.targets, 0.5), {'num_replicas': 0}),
+                             ((self.targets, 0.5), {'num_replicas': 2, 'rank': 2}),
+                             (([0, 0, 0], 0.5), {}), (([2, 0], 0.5), {})):
+            with self.subTest(args=args[1:], kwargs=kwargs), self.assertRaises(ValueError):
+                BalancedDistributedSampler(*args, **kwargs)
 
 
 class FoldTests(unittest.TestCase):
@@ -341,7 +503,8 @@ class DatasetTests(unittest.TestCase):
         valid[0]
         self.assertEqual(backend.calls, [2, 9])
         self.assertEqual(train.targets, [1])
-        self.assertEqual(set(sample), {'images', 'target', 'prediction_id', 'sample_ids'})
+        self.assertEqual(set(sample),
+                         {'images', 'target', 'aux_targets', 'prediction_id', 'sample_ids'})
         self.assertEqual(sample['images'].shape, (1, 3, 4, 4))
         self.assertEqual(sample['sample_ids'], ['1_1'])
         self.assertEqual(sample['target'], 1.0)
@@ -353,8 +516,9 @@ class DatasetTests(unittest.TestCase):
         self.assertNotEqual(positive['target'], negative['target'])
         self.assertTrue(torch.equal(positive['images'], negative['images']))
         for call in transform.call_args_list:
-            self.assertEqual(len(call.args), 1)
+            self.assertEqual(len(call.args), 2)
             self.assertIsInstance(call.args[0], np.ndarray)
+            self.assertIsNone(call.args[1])
         self.assertEqual(dataset.targets, [1, 0])
 
     def test_every_metadata_field_verified_before_transform(self):
@@ -406,7 +570,7 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(subset[0]['sample_ids'], ['1_1', '1_4'])
         for change in ({'label': 0}, {'patient_id': '2'}):
             records = [self.records[0], replace(self.records[1], **change)]
-            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'one patient and cancer'):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'one patient, cancer'):
                 BreastDataset(self.backend, records, [0, 1], self.transform)
         for cap in (0, -1, 1.5):
             with self.subTest(cap=cap), self.assertRaises(ValueError):
@@ -419,7 +583,9 @@ class DatasetTests(unittest.TestCase):
         dataset = BreastDataset(self.backend, self.records, range(6), self.transform)
         items = [dataset[1], dataset[0]]
         batch = collate_samples(items)
-        self.assertEqual(set(batch), {'images', 'view_mask', 'targets', 'prediction_ids', 'sample_ids'})
+        self.assertEqual(set(batch), {'images', 'view_mask', 'targets', 'aux_targets',
+                                      'prediction_ids', 'sample_ids'})
+        self.assertEqual(batch['aux_targets'].shape, (2, 0))
         self.assertEqual(batch['images'].shape, (2, 5, 3, 4, 4))
         self.assertEqual(batch['view_mask'].dtype, torch.bool)
         self.assertEqual(batch['view_mask'].tolist(), [[True, False, False, False, False], [True] * 5])

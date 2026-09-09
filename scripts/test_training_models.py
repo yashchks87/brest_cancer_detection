@@ -269,6 +269,23 @@ class TrainingModelTests(unittest.TestCase):
                 with self.subTest(approach=approach, case=index), self.assertRaises(ValueError):
                     model(images, torch.ones(2, 2, dtype=torch.bool))
 
+    def test_auxiliary_outputs_widen_only_the_classifier(self):
+        for approach, kwargs in (('advanced', {}), ('vit', {'image_size': 64})):
+            with self.subTest(approach=approach):
+                single = build_model(approach, pretrained=False, **kwargs)
+                multi = build_model(approach, pretrained=False, num_outputs=3, **kwargs)
+                images, mask = torch.rand(2, 2, 3, 64, 64), torch.ones(2, 2, dtype=torch.bool)
+                self.assertEqual(single(images, mask).shape, (2,))
+                self.assertEqual(multi(images, mask).shape, (2, 3))
+                self.assertEqual(multi.classifier[-1].out_features, 3)
+                self.assertEqual(multi.attention_score.out_features,
+                                 single.attention_score.out_features)
+        for num_outputs in (0, -1, 1.5):
+            with self.subTest(num_outputs=num_outputs), self.assertRaises(ValueError):
+                build_model('advanced', pretrained=False, num_outputs=num_outputs)
+        with self.assertRaisesRegex(ValueError, 'simple approach does not support'):
+            build_model('simple', pretrained=False, num_outputs=2)
+
     def test_unknown_approach_rejected(self):
         for approach in ('unknown', '', 'Simple', None):
             with self.subTest(approach=approach), self.assertRaises(ValueError):

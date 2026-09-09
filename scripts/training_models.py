@@ -8,6 +8,14 @@ from torchvision import models
 APPROACHES = ('simple', 'advanced', 'vit')
 VIT_PATCH_SIZE = 16
 VIT_PRETRAINED_SIZE = 224
+CNN_ENCODER_WEIGHTS = {
+    'convnext_tiny': 'ConvNeXt_Tiny_Weights',
+    'resnet50': 'ResNet50_Weights',
+    'efficientnet_b3': 'EfficientNet_B3_Weights',
+    'efficientnet_v2_s': 'EfficientNet_V2_S_Weights',
+}
+CNN_ENCODERS = tuple(CNN_ENCODER_WEIGHTS)
+DEFAULT_CNN_ENCODER = 'convnext_tiny'
 
 
 def _validate_inputs(images: torch.Tensor, view_mask: torch.Tensor) -> None:
@@ -38,11 +46,15 @@ def _vit_pretrained_state() -> dict:
     return models.ViT_B_16_Weights.DEFAULT.get_state_dict(progress=False)
 
 
-def _convnext_encoder(pretrained: bool) -> tuple[nn.Module, int]:
-    weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
-    encoder = models.convnext_tiny(weights=weights)
-    feature_dim = encoder.classifier[-1].in_features
-    encoder.classifier[-1] = nn.Identity()
+def _cnn_encoder(name: str, pretrained: bool) -> tuple[nn.Module, int]:
+    weights = getattr(models, CNN_ENCODER_WEIGHTS[name]).DEFAULT if pretrained else None
+    encoder = getattr(models, name)(weights=weights)
+    head = encoder.fc if name.startswith('resnet') else encoder.classifier[-1]
+    feature_dim = head.in_features
+    if name.startswith('resnet'):
+        encoder.fc = nn.Identity()
+    else:
+        encoder.classifier[-1] = nn.Identity()
     return encoder, feature_dim
 
 
@@ -82,14 +94,16 @@ class SimpleModel(nn.Module):
 
 
 class MultiViewModel(nn.Module):
-    def __init__(self, encoder: nn.Module, feature_dim: int, dropout: float, view_chunk_size: int):
+    def __init__(self, encoder: nn.Module, feature_dim: int, dropout: float, view_chunk_size: int,
+                 num_outputs: int = 1):
         super().__init__()
         self.encoder = encoder
         self.attention_tanh = nn.Linear(feature_dim, 128)
         self.attention_sigmoid = nn.Linear(feature_dim, 128)
         self.attention_score = nn.Linear(128, 1)
-        self.classifier = nn.Sequential(nn.Dropout(dropout), nn.Linear(feature_dim, 1))
+        self.classifier = nn.Sequential(nn.Dropout(dropout), nn.Linear(feature_dim, num_outputs))
         self.view_chunk_size = view_chunk_size
+        self.num_outputs = num_outputs
 
     def forward(self, images: torch.Tensor, view_mask: torch.Tensor) -> torch.Tensor:
         _validate_inputs(images, view_mask)
@@ -104,13 +118,21 @@ class MultiViewModel(nn.Module):
         scores = self.attention_score(gated).squeeze(-1)
         attention = torch.softmax(scores.float().masked_fill(~view_mask, -torch.inf), dim=1)
         pooled = (features * attention.to(features.dtype).unsqueeze(-1)).sum(dim=1)
-        return self.classifier(pooled).squeeze(-1)
+        logits = self.classifier(pooled)
+        return logits.squeeze(-1) if self.num_outputs == 1 else logits
 
 
 def build_model(approach: str, pretrained: bool = True, dropout: float = 0.2,
-                view_chunk_size: int = 8, image_size: int | None = None) -> nn.Module:
+                view_chunk_size: int = 8, image_size: int | None = None,
+                encoder: str = DEFAULT_CNN_ENCODER, num_outputs: int = 1) -> nn.Module:
     if approach not in APPROACHES:
         raise ValueError('Approach must be simple, advanced, or vit.')
+    if encoder not in CNN_ENCODERS:
+        raise ValueError(f'Encoder must be one of {", ".join(CNN_ENCODERS)}.')
+    if type(num_outputs) is not int or num_outputs < 1:
+        raise ValueError('num_outputs must be a positive integer.')
+    if num_outputs > 1 and approach == 'simple':
+        raise ValueError('The simple approach does not support auxiliary outputs.')
     if not isinstance(pretrained, bool):
         raise ValueError('Pretrained must be a boolean.')
     if (isinstance(dropout, bool) or not isinstance(dropout, (int, float))
@@ -125,7 +147,9 @@ def build_model(approach: str, pretrained: bool = True, dropout: float = 0.2,
             raise ValueError('The ViT approach requires an explicit image size.')
         if image_size % VIT_PATCH_SIZE:
             raise ValueError(f'ViT image size must be a multiple of {VIT_PATCH_SIZE}.')
-        return MultiViewModel(*_vit_encoder(pretrained, image_size), float(dropout), view_chunk_size)
+        return MultiViewModel(*_vit_encoder(pretrained, image_size), float(dropout),
+                              view_chunk_size, num_outputs)
     if approach == 'simple':
         return SimpleModel(pretrained, view_chunk_size)
-    return MultiViewModel(*_convnext_encoder(pretrained), float(dropout), view_chunk_size)
+    return MultiViewModel(*_cnn_encoder(encoder, pretrained), float(dropout), view_chunk_size,
+                          num_outputs)

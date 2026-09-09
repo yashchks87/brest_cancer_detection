@@ -24,14 +24,16 @@ from tqdm import tqdm
 from scripts.benchmark_mds import RSNAStreamingDataset, validate_paths
 from scripts.metrics import aggregate_predictions, pf1
 from scripts.training_data import (
+    BalancedDistributedSampler,
     BreastDataset,
     ImageDataset,
     ImageTransform,
     collate_samples,
     load_training_records,
     patient_fold_assignments,
+    read_roi_boxes,
 )
-from scripts.training_models import build_model
+from scripts.training_models import CNN_ENCODERS, DEFAULT_CNN_ENCODER, build_model
 
 
 DEFAULT_MDS = Path('/Volumes/daai_ke_team/default/images/cancer_dataset/shrads/cancer_dataset_mds_v3')
@@ -112,16 +114,30 @@ def update_ema(ema_model, model, decay):
         target.copy_(source)
 
 
+def _split_logits(logits, targets, aux_targets):
+    """Separate the cancer logit from any auxiliary logits and validate the shapes."""
+    aux_width = aux_targets.shape[1] if aux_targets is not None else 0
+    if not aux_width:
+        if logits.shape != targets.shape:
+            raise ValueError('Model logits must have one value per target.')
+        return logits, None
+    if logits.ndim != 2 or logits.shape != (targets.shape[0], aux_width + 1):
+        raise ValueError(f'Model must emit {aux_width + 1} logits per sample for the cancer '
+                         f'target plus {aux_width} auxiliary targets.')
+    return logits[:, 0], logits[:, 1:]
+
+
 def run_epoch(model, loader, device, *, optimizer=None, scaler=None, amp=False,
               amp_dtype=torch.float16, grad_accum=1, pos_weight=1.0, clip_grad=1.0,
               max_batches=None, ema_model=None, ema_decay=0.0, description='',
-              no_progress=False, cluster=None):
+              no_progress=False, cluster=None, aux_weight=0.0):
     training = optimizer is not None
     cluster = Cluster() if cluster is None else cluster
     model.train(training)
     criterion = nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(pos_weight if training else 1.0, device=device), reduction='sum'
     )
+    aux_criterion = nn.BCEWithLogitsLoss(reduction='sum')
     batches = len(loader) if max_batches is None else min(len(loader), max_batches)
     if batches < 1:
         raise ValueError('Cannot train or validate with an empty loader.')
@@ -136,15 +152,21 @@ def run_epoch(model, loader, device, *, optimizer=None, scaler=None, amp=False,
             images = batch['images'].to(device, non_blocking=True)
             mask = batch['view_mask'].to(device, non_blocking=True)
             targets = batch['targets'].to(device, non_blocking=True)
+            aux_targets = batch.get('aux_targets')
+            if aux_targets is not None and aux_targets.shape[1]:
+                aux_targets = aux_targets.to(device, non_blocking=True)
+            else:
+                aux_targets = None
             boundary = (step + 1) % grad_accum == 0 or step + 1 == batches
             accumulating = (training and not boundary and isinstance(model, DistributedDataParallel))
             with model.no_sync() if accumulating else contextlib.nullcontext():
                 with torch.set_grad_enabled(training):
                     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp):
-                        logits = model(images, mask)
-                        if logits.shape != targets.shape:
-                            raise ValueError('Model logits must have one value per target.')
+                        logits, aux_logits = _split_logits(model(images, mask), targets, aux_targets)
                         loss = criterion(logits, targets)
+                        if aux_logits is not None and aux_weight:
+                            loss = loss + aux_weight * aux_criterion(
+                                aux_logits, aux_targets) / aux_targets.shape[1]
                     if not torch.isfinite(loss):
                         raise ValueError('Nonfinite loss; inspect image intensities, learning rate, and weights.')
                     if training:
@@ -281,6 +303,28 @@ def build_parser(approach):
                         help='Explicit input intensity scale, e.g. 4095 for 12-bit pixels in uint16.')
     parser.add_argument('--pooling', choices=('mean', 'max'), default='mean',
                         help='Image-to-breast validation pooling; breast-level models emit one score already.')
+    parser.add_argument('--roi-crop', action=argparse.BooleanOptionalAction, default=False,
+                        help='Crop to the largest bright connected component (the breast) before '
+                             'resizing, instead of letterboxing the whole detector frame.')
+    parser.add_argument('--roi-boxes', type=Path,
+                        help='ROI box CSV from scripts/compute_roi_boxes.py. Without it boxes are '
+                             'recomputed on the fly every epoch, which is correct but slower.')
+    parser.add_argument('--roi-margin', type=float, default=0.05,
+                        help='Fractional margin added around the detected box so skin lines and '
+                             'the axillary tail survive the crop.')
+    parser.add_argument('--canonical-side', choices=('none', 'left', 'right'), default='none',
+                        help='Flip every image so the chest wall lands on this side. Detected from '
+                             'the ROI position, not the CSV laterality, which disagrees by site.')
+    parser.add_argument('--positive-fraction', type=float,
+                        help='Resample each epoch to this fraction of positive breasts, e.g. 0.2 '
+                             'for 1:4. Off by default. Lower --pos-weight when enabling this.')
+    parser.add_argument('--aux-targets', nargs='*', default=[], metavar='COLUMN',
+                        help='Extra binary CSV columns predicted by auxiliary heads, e.g. biopsy '
+                             'invasive. They densify supervision but never change the pF1 target.')
+    parser.add_argument('--aux-weight', type=float, default=0.2,
+                        help='Weight on the mean auxiliary loss; ignored without --aux-targets.')
+    parser.add_argument('--encoder', choices=CNN_ENCODERS, default=DEFAULT_CNN_ENCODER,
+                        help='Convolutional backbone for the advanced approach; ignored by simple and vit.')
     parser.add_argument('--pretrained', action=argparse.BooleanOptionalAction, default=True,
                         help='Use torchvision ImageNet weights (may download); --no-pretrained is offline.')
     parser.add_argument('--amp', action=argparse.BooleanOptionalAction, default=breast)
@@ -335,6 +379,23 @@ def validate_args(args, approach='simple'):
         raise ValueError('--weight-decay must be finite and nonnegative.')
     if not 0 <= args.dropout < 1 or not 0 <= args.ema_decay < 1:
         raise ValueError('--dropout and --ema-decay must be in [0, 1).')
+    if not math.isfinite(args.roi_margin) or args.roi_margin < 0:
+        raise ValueError('--roi-margin must be finite and nonnegative.')
+    if args.positive_fraction is not None and (not math.isfinite(args.positive_fraction)
+                                               or not 0 < args.positive_fraction < 1):
+        raise ValueError('--positive-fraction must be strictly between 0 and 1.')
+    if len(set(args.aux_targets)) != len(args.aux_targets):
+        raise ValueError('--aux-targets must not repeat a column.')
+    if 'cancer' in args.aux_targets:
+        raise ValueError('--aux-targets must not include the cancer target itself.')
+    if args.aux_targets and approach == 'simple':
+        raise ValueError('--aux-targets is unsupported for the simple approach.')
+    if not math.isfinite(args.aux_weight) or args.aux_weight < 0:
+        raise ValueError('--aux-weight must be finite and nonnegative.')
+    if args.roi_boxes is not None and not args.roi_boxes.is_file():
+        raise ValueError(f'--roi-boxes must point at an existing CSV: {args.roi_boxes}')
+    if args.roi_boxes is not None and not (args.roi_crop or args.canonical_side != 'none'):
+        raise ValueError('--roi-boxes has no effect without --roi-crop or --canonical-side.')
     if args.intensity_max is not None and (not math.isfinite(args.intensity_max) or args.intensity_max <= 0):
         raise ValueError('--intensity-max must be finite and positive.')
     cluster = cluster_from_environment()
@@ -423,7 +484,11 @@ def _train(args, approach, cluster, device):
         torch.cuda.manual_seed_all(args.seed)
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
-    manifest, records = load_training_records(remote, args.csv)
+    aux_targets = tuple(args.aux_targets)
+    canonical_side = None if args.canonical_side == 'none' else args.canonical_side
+    manifest, records = load_training_records(remote, args.csv, aux_targets)
+    roi_boxes = (read_roi_boxes(args.roi_boxes)
+                 if args.roi_boxes is not None and (args.roi_crop or canonical_side) else None)
     source_images = Path(manifest['images_dir']).resolve()
     if output == source_images or output in source_images.parents or source_images in output.parents:
         raise ValueError('Run output must be separate from the original source images directory.')
@@ -436,18 +501,22 @@ def _train(args, approach, cluster, device):
         raise ValueError('No training images remain after applying --fold and --exclude-folds.')
     backend = RSNAStreamingDataset(remote=str(remote), local=str(local), decode_images=True,
                                    shuffle=False, batch_size=1, cache_limit=args.cache_limit)
-    train_transform = ImageTransform(args.image_size, training=True, intensity_max=args.intensity_max)
-    val_transform = ImageTransform(args.image_size, training=False, intensity_max=args.intensity_max)
+    transform_kwargs = dict(intensity_max=args.intensity_max, roi_crop=args.roi_crop,
+                            roi_margin=args.roi_margin, canonical_side=canonical_side)
+    train_transform = ImageTransform(args.image_size, training=True, **transform_kwargs)
+    val_transform = ImageTransform(args.image_size, training=False, **transform_kwargs)
     if approach in BREAST_APPROACHES:
         train_dataset = BreastDataset(backend, records, train_indices, train_transform,
-                                      max_views=args.max_views, training=True)
-        val_dataset = BreastDataset(backend, records, val_indices, val_transform, training=False)
+                                      max_views=args.max_views, training=True, roi_boxes=roi_boxes)
+        val_dataset = BreastDataset(backend, records, val_indices, val_transform, training=False,
+                                    roi_boxes=roi_boxes)
     else:
-        train_dataset = ImageDataset(backend, records, train_indices, train_transform)
-        val_dataset = ImageDataset(backend, records, val_indices, val_transform)
+        train_dataset = ImageDataset(backend, records, train_indices, train_transform, roi_boxes)
+        val_dataset = ImageDataset(backend, records, val_indices, val_transform, roi_boxes)
     weight = positive_weight(train_dataset.targets, args.pos_weight)
     raw_model = build_model(approach, pretrained=args.pretrained, dropout=args.dropout,
-                            image_size=args.image_size,
+                            image_size=args.image_size, encoder=args.encoder,
+                            num_outputs=1 + len(aux_targets),
                             view_chunk_size=(args.view_chunk_size if approach in BREAST_APPROACHES
                                              else args.batch_size)).to(device)
     ema_model = copy.deepcopy(raw_model).eval().requires_grad_(False) if args.ema_decay else None
@@ -463,6 +532,11 @@ def _train(args, approach, cluster, device):
                                    shuffle=shuffle, seed=args.seed, drop_last=False)
                 if cluster.distributed else None
                 for dataset, shuffle in ((train_dataset, True), (val_dataset, False))]
+    if args.positive_fraction is not None:
+        samplers[0] = BalancedDistributedSampler(
+            train_dataset.targets, args.positive_fraction, num_replicas=cluster.world_size,
+            rank=cluster.rank, seed=args.seed,
+        )
     worker_kwargs = ({'multiprocessing_context': 'spawn', 'persistent_workers': True,
                       'prefetch_factor': 2} if args.num_workers else {})
     loader_kwargs = dict(batch_size=args.batch_size, num_workers=args.num_workers,
@@ -496,6 +570,14 @@ def _train(args, approach, cluster, device):
         'validation_positive_breasts': sum(val_truth.values()),
         'constant_prevalence_pf1': pf1(val_truth.values(), [prevalence] * len(val_truth)),
         'validation_weights': 'ema' if ema_model is not None else 'model',
+        'roi_crop': bool(args.roi_crop),
+        'roi_boxes_cached': roi_boxes is not None,
+        'canonical_side': canonical_side,
+        'positive_sampling': ('balanced' if args.positive_fraction is not None else 'natural'),
+        'train_positive_breast_fraction': sum(train_dataset.targets) / len(train_dataset.targets),
+        'aux_targets': list(aux_targets),
+        'aux_weight': args.aux_weight if aux_targets else 0.0,
+        'model_outputs': 1 + len(aux_targets),
     }
     run = None
     cluster.barrier()
@@ -526,6 +608,7 @@ def _train(args, approach, cluster, device):
             amp_dtype=amp_dtype, grad_accum=args.grad_accum, pos_weight=weight,
             clip_grad=args.clip_grad, max_batches=args.max_train_batches,
             ema_model=ema_model, ema_decay=args.ema_decay, cluster=cluster,
+            aux_weight=args.aux_weight if aux_targets else 0.0,
             description=f'Epoch {epoch}/{args.epochs} train', no_progress=args.no_progress,
         )
         evaluation_model = ema_model if ema_model is not None else raw_model

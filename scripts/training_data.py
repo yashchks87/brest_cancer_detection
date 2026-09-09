@@ -1,16 +1,23 @@
+import csv
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
 from scripts.benchmark_mds import read_manifest
 from scripts.convert_to_mds import load_records
+
+
+AUX_TARGET_VALUES = {'0': 0.0, '1': 1.0, 'False': 0.0, 'True': 1.0}
+ROI_ANALYSIS_SIZE = 256
+ROI_THRESHOLD = 0.05
+ROI_MIN_AREA_FRACTION = 0.01
 
 
 @dataclass(frozen=True)
@@ -20,6 +27,8 @@ class TrainingRecord:
     patient_id: str
     prediction_id: str
     label: int
+    laterality: str = ''
+    aux: tuple[float, ...] = field(default_factory=tuple)
 
 
 def _check_count(manifest, key, expected):
@@ -27,7 +36,21 @@ def _check_count(manifest, key, expected):
         raise ValueError(f'Manifest {key} does not match reconstructed CSV metadata ({expected}).')
 
 
-def load_training_records(remote: Path, csv_path: Path | None = None) -> tuple[dict, list[TrainingRecord]]:
+def _aux_values(metadata: dict, aux_targets, sample_id: str) -> tuple[float, ...]:
+    values = []
+    for column in aux_targets:
+        if column not in metadata:
+            raise ValueError(f'Auxiliary target {column!r} is not a column in the source CSV.')
+        raw = metadata[column]
+        if raw not in AUX_TARGET_VALUES:
+            raise ValueError(f'Auxiliary target {column!r} must be binary for every row; '
+                             f'sample {sample_id} has {raw!r}. Columns with blanks are unsupported.')
+        values.append(AUX_TARGET_VALUES[raw])
+    return tuple(values)
+
+
+def load_training_records(remote: Path, csv_path: Path | None = None,
+                          aux_targets=()) -> tuple[dict, list[TrainingRecord]]:
     try:
         manifest = read_manifest(Path(remote))
     except (KeyError, TypeError, AttributeError) as error:
@@ -77,11 +100,14 @@ def load_training_records(remote: Path, csv_path: Path | None = None) -> tuple[d
         if type(entry.get('cancer')) is not int or any(entry.get(key) != value for key, value in expected.items()):
             raise ValueError(f'Skipped image metadata differs from CSV for {sample_id}.')
         skipped_ids.add(sample_id)
+    aux_targets = tuple(aux_targets)
     records = []
     for sample_id, record in selected.items():
         if sample_id not in skipped_ids:
             records.append(TrainingRecord(len(records), sample_id, record.metadata['patient_id'],
-                                          record.prediction_id, int(record.metadata['cancer'])))
+                                          record.prediction_id, int(record.metadata['cancer']),
+                                          record.metadata.get('laterality', ''),
+                                          _aux_values(record.metadata, aux_targets, sample_id)))
     for key, count in (
         ('samples', len(records)),
         ('patients', len({record.patient_id for record in records})),
@@ -111,21 +137,160 @@ def patient_fold_assignments(records, n_folds: int, seed: int) -> dict[str, int]
     return assignments
 
 
+def _grayscale_preview(pixels: np.ndarray, analysis_size: int) -> np.ndarray:
+    image = pixels if pixels.ndim == 2 else pixels.mean(axis=2)
+    step = max(1, math.ceil(max(image.shape) / analysis_size))
+    preview = np.asarray(image[::step, ::step], dtype=np.float32)
+    peak = float(preview.max()) if preview.size else 0.0
+    return preview / peak if peak > 0 else preview
+
+
+def _component_boxes(mask: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+    """Label 4-connected runs with union-find; return (area, x0, y0, x1, y1) per component."""
+    parent: list[int] = []
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left, right):
+        left, right = find(left), find(right)
+        if left != right:
+            parent[max(left, right)] = min(left, right)
+
+    runs: list[tuple[int, int, int]] = []
+    previous: list[tuple[int, int, int]] = []
+    for row, line in enumerate(mask):
+        current = []
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], line.astype(np.int8), [0]))))
+        for start, end in zip(edges[0::2].tolist(), edges[1::2].tolist()):
+            label = len(runs)
+            parent.append(label)
+            runs.append((row, start, end))
+            for previous_start, previous_end, previous_label in previous:
+                if previous_start < end and start < previous_end:
+                    union(label, previous_label)
+            current.append((start, end, label))
+        previous = current
+    components: dict[int, list[int]] = {}
+    for label, (row, start, end) in enumerate(runs):
+        root = find(label)
+        box = components.get(root)
+        if box is None:
+            components[root] = [end - start, start, row, end, row + 1]
+        else:
+            box[0] += end - start
+            box[1], box[2] = min(box[1], start), min(box[2], row)
+            box[3], box[4] = max(box[3], end), max(box[4], row + 1)
+    return [tuple(box) for box in components.values()]
+
+
+def roi_bounding_box(pixels: np.ndarray, threshold: float = ROI_THRESHOLD,
+                     min_area_fraction: float = ROI_MIN_AREA_FRACTION,
+                     analysis_size: int = ROI_ANALYSIS_SIZE) -> tuple[int, int, int, int]:
+    """Tight half-open (x0, y0, x1, y1) box around the largest bright component.
+
+    Falls back to the full frame whenever detection is unconvincing, so a bad
+    threshold can never silently delete anatomy.
+    """
+    if not isinstance(pixels, np.ndarray) or pixels.ndim not in (2, 3):
+        raise ValueError('Pixels must be a grayscale or RGB NumPy array.')
+    if not 0 < threshold < 1 or not 0 <= min_area_fraction < 1:
+        raise ValueError('threshold must be in (0, 1) and min_area_fraction in [0, 1).')
+    if type(analysis_size) is not int or analysis_size < 16:
+        raise ValueError('analysis_size must be an integer of at least 16.')
+    height, width = pixels.shape[:2]
+    full = (0, 0, width, height)
+    preview = _grayscale_preview(pixels, analysis_size)
+    if not preview.size or not np.isfinite(preview).all():
+        return full
+    boxes = _component_boxes(preview > threshold)
+    if not boxes:
+        return full
+    area, x0, y0, x1, y1 = max(boxes)
+    if area < min_area_fraction * preview.size:
+        return full
+    scale_x, scale_y = width / preview.shape[1], height / preview.shape[0]
+    box = (max(0, int(math.floor(x0 * scale_x))), max(0, int(math.floor(y0 * scale_y))),
+           min(width, int(math.ceil(x1 * scale_x))), min(height, int(math.ceil(y1 * scale_y))))
+    return full if box[2] - box[0] < 1 or box[3] - box[1] < 1 else box
+
+
+def expand_box(box, width: int, height: int, margin: float) -> tuple[int, int, int, int]:
+    if not math.isfinite(margin) or margin < 0:
+        raise ValueError('ROI margin must be finite and nonnegative.')
+    x0, y0, x1, y1 = box
+    pad_x, pad_y = margin * (x1 - x0), margin * (y1 - y0)
+    return (max(0, int(math.floor(x0 - pad_x))), max(0, int(math.floor(y0 - pad_y))),
+            min(width, int(math.ceil(x1 + pad_x))), min(height, int(math.ceil(y1 + pad_y))))
+
+
+def read_roi_boxes(path: Path) -> dict[str, tuple[int, int, int, int]]:
+    with Path(path).open(newline='', encoding='utf-8-sig') as file:
+        reader = csv.DictReader(file)
+        required = {'sample_id', 'x0', 'y0', 'x1', 'y1'}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError(f'ROI box CSV must contain the columns {sorted(required)}.')
+        boxes = {}
+        for row in reader:
+            sample_id = row['sample_id']
+            box = tuple(int(row[key]) for key in ('x0', 'y0', 'x1', 'y1'))
+            if sample_id in boxes:
+                raise ValueError(f'Duplicate ROI box for sample {sample_id}.')
+            if box[0] < 0 or box[1] < 0 or box[2] <= box[0] or box[3] <= box[1]:
+                raise ValueError(f'ROI box for sample {sample_id} is empty or negative.')
+            boxes[sample_id] = box
+    if not boxes:
+        raise ValueError('ROI box CSV contains no rows.')
+    return boxes
+
+
 class ImageTransform:
-    def __init__(self, size: int, training: bool = False, intensity_max: float | None = None):
+    def __init__(self, size: int, training: bool = False, intensity_max: float | None = None,
+                 roi_crop: bool = False, roi_margin: float = 0.05,
+                 canonical_side: str | None = None):
         if type(size) is not int or size < 1:
             raise ValueError('Image size must be a positive integer.')
         if intensity_max is not None and (not math.isfinite(intensity_max) or intensity_max <= 0):
             raise ValueError('intensity_max must be finite and positive.')
+        if not isinstance(roi_crop, bool):
+            raise ValueError('roi_crop must be a boolean.')
+        if not math.isfinite(roi_margin) or roi_margin < 0:
+            raise ValueError('roi_margin must be finite and nonnegative.')
+        if canonical_side not in (None, 'left', 'right'):
+            raise ValueError("canonical_side must be None, 'left', or 'right'.")
         self.size = size
         self.training = training
         self.intensity_max = intensity_max
+        self.roi_crop = roi_crop
+        self.roi_margin = roi_margin
+        self.canonical_side = canonical_side
 
-    def __call__(self, pixels: np.ndarray) -> torch.Tensor:
+    def _needs_canonical_flip(self, box, frame_width: int) -> bool:
+        if self.canonical_side is None:
+            return False
+        chest_side = 'left' if box[0] <= frame_width - box[2] else 'right'
+        return chest_side != self.canonical_side
+
+    def __call__(self, pixels: np.ndarray, box=None) -> torch.Tensor:
         if not isinstance(pixels, np.ndarray) or pixels.ndim not in (2, 3):
             raise ValueError('Pixels must be a grayscale or RGB NumPy array.')
         if not pixels.size or (pixels.ndim == 3 and pixels.shape[2] not in (1, 3)):
             raise ValueError('Pixels must have nonempty spatial dimensions and one or three channels.')
+        canonical_flip = False
+        if self.roi_crop or self.canonical_side is not None:
+            frame_height, frame_width = pixels.shape[:2]
+            box = roi_bounding_box(pixels) if box is None else tuple(box)
+            if box[0] < 0 or box[1] < 0 or box[2] > frame_width or box[3] > frame_height:
+                raise ValueError(f'ROI box {box} falls outside the {frame_width}x{frame_height} frame.')
+            if box[2] <= box[0] or box[3] <= box[1]:
+                raise ValueError(f'ROI box {box} is empty.')
+            canonical_flip = self._needs_canonical_flip(box, frame_width)
+            if self.roi_crop:
+                x0, y0, x1, y1 = expand_box(box, frame_width, frame_height, self.roi_margin)
+                pixels = pixels[y0:y1, x0:x1]
         kind, width = pixels.dtype.kind, pixels.dtype.itemsize
         if kind == 'u' and width in (1, 2):
             scale = 255.0 if width == 1 else 65535.0
@@ -144,6 +309,8 @@ class ImageTransform:
         image = image.permute(2, 0, 1)
         if image.shape[0] == 1:
             image = image.expand(3, -1, -1)
+        if canonical_flip:
+            image = TF.hflip(image)
         height, width = image.shape[-2:]
         ratio = self.size / max(height, width)
         height, width = max(1, round(height * ratio)), max(1, round(width * ratio))
@@ -160,7 +327,7 @@ class ImageTransform:
 
 
 class ImageDataset(Dataset):
-    def __init__(self, backend, records, indices, transform):
+    def __init__(self, backend, records, indices, transform, roi_boxes=None):
         indices = list(indices)
         if any(not isinstance(index, (int, np.integer)) or index < 0 or index >= len(records)
                for index in indices) or len(set(indices)) != len(indices):
@@ -168,7 +335,13 @@ class ImageDataset(Dataset):
         self.backend = backend
         self.records = [records[index] for index in indices]
         self.transform = transform
+        self.roi_boxes = roi_boxes
         self.targets = [record.label for record in self.records]
+        if roi_boxes is not None:
+            missing = [record.sample_id for record in self.records if record.sample_id not in roi_boxes]
+            if missing:
+                raise ValueError(f'ROI box cache is missing {len(missing)} samples, '
+                                 f'starting with {missing[0]}. Recompute it for this dataset.')
 
     def __len__(self):
         return len(self.targets)
@@ -183,8 +356,10 @@ class ImageDataset(Dataset):
                 if sample.get(key) != value:
                     raise ValueError(f'MDS sample mismatch at index {record.index}: {key} '
                                      f'expected {value!r}, got {sample.get(key)!r}.')
-            images.append(self.transform(sample['image']))
+            box = None if self.roi_boxes is None else self.roi_boxes[record.sample_id]
+            images.append(self.transform(sample['image'], box))
         return {'images': torch.stack(images), 'target': float(records[0].label),
+                'aux_targets': list(records[0].aux),
                 'prediction_id': records[0].prediction_id,
                 'sample_ids': [record.sample_id for record in records]}
 
@@ -194,15 +369,17 @@ class ImageDataset(Dataset):
 
 class BreastDataset(ImageDataset):
     def __init__(self, backend, records, indices, transform, max_views: int | None = None,
-                 training: bool = False):
+                 training: bool = False, roi_boxes=None):
         if max_views is not None and (type(max_views) is not int or max_views < 1):
             raise ValueError('max_views must be a positive integer or None.')
-        super().__init__(backend, records, indices, transform)
+        super().__init__(backend, records, indices, transform, roi_boxes)
         groups = {}
         for record in self.records:
             group = groups.setdefault(record.prediction_id, [])
-            if group and (group[0].patient_id != record.patient_id or group[0].label != record.label):
-                raise ValueError(f'Breast {record.prediction_id} must have one patient and cancer label.')
+            if group and (group[0].patient_id != record.patient_id or group[0].label != record.label
+                          or group[0].aux != record.aux):
+                raise ValueError(f'Breast {record.prediction_id} must have one patient, cancer '
+                                 f'label, and auxiliary target vector.')
             group.append(record)
         self.groups = list(groups.values())
         self.targets = [group[0].label for group in self.groups]
@@ -214,6 +391,62 @@ class BreastDataset(ImageDataset):
         if self.training and self.max_views is not None and len(records) > self.max_views:
             records = [records[index] for index in torch.randperm(len(records))[:self.max_views].tolist()]
         return self._make_sample(records)
+
+
+class BalancedDistributedSampler(Sampler):
+    """Rebalance each epoch to a fixed positive fraction, identically on every rank.
+
+    Positives are drawn with replacement (there are far too few to fill the quota
+    otherwise) and negatives without, so the epoch keeps its original length and
+    the optimizer-step count stays comparable to an unbalanced run. Every rank
+    derives the same permutation from ``seed + epoch``, so no communication is
+    needed and resuming stays deterministic.
+    """
+
+    def __init__(self, targets, positive_fraction: float, num_replicas: int = 1, rank: int = 0,
+                 seed: int = 0):
+        if not math.isfinite(positive_fraction) or not 0 < positive_fraction < 1:
+            raise ValueError('positive_fraction must be a finite number strictly between 0 and 1.')
+        if type(num_replicas) is not int or num_replicas < 1:
+            raise ValueError('num_replicas must be a positive integer.')
+        if type(rank) is not int or not 0 <= rank < num_replicas:
+            raise ValueError('rank must be an integer in 0..num_replicas-1.')
+        targets = [int(target) for target in targets]
+        if any(target not in (0, 1) for target in targets):
+            raise ValueError('Sampler targets must be binary.')
+        self.positives = np.flatnonzero(np.asarray(targets) == 1)
+        self.negatives = np.flatnonzero(np.asarray(targets) == 0)
+        if not len(self.positives) or not len(self.negatives):
+            raise ValueError('Balanced sampling needs both positive and negative samples.')
+        self.total = len(targets)
+        self.positive_fraction = float(positive_fraction)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0
+        self.samples_per_replica = math.ceil(self.total / num_replicas)
+        self.positive_quota = min(max(1, round(self.total * self.positive_fraction)), self.total - 1)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _epoch_indices(self) -> np.ndarray:
+        generator = np.random.default_rng((self.seed * 1_000_003 + self.epoch) % (2 ** 32))
+        negative_quota = self.total - self.positive_quota
+        positives = generator.choice(self.positives, size=self.positive_quota, replace=True)
+        negatives = (generator.permutation(self.negatives)[:negative_quota]
+                     if negative_quota <= len(self.negatives)
+                     else generator.choice(self.negatives, size=negative_quota, replace=True))
+        indices = np.concatenate([positives, negatives])
+        generator.shuffle(indices)
+        padding = self.samples_per_replica * self.num_replicas - len(indices)
+        return np.concatenate([indices, indices[:padding]]) if padding else indices
+
+    def __iter__(self):
+        return iter(self._epoch_indices()[self.rank::self.num_replicas].tolist())
+
+    def __len__(self):
+        return self.samples_per_replica
 
 
 def collate_samples(items):
@@ -228,6 +461,9 @@ def collate_samples(items):
             raise ValueError('Images must be nonempty float32 tensors.')
         if len(item['sample_ids']) != len(images) or item['target'] not in (0, 1):
             raise ValueError('Sample IDs must match the views and targets must be binary.')
+    aux_width = len(items[0].get('aux_targets', ()))
+    if any(len(item.get('aux_targets', ())) != aux_width for item in items):
+        raise ValueError('Every sample must carry the same number of auxiliary targets.')
     max_views = max(len(item['images']) for item in items)
     images = items[0]['images'].new_zeros((len(items), max_views, *shape))
     view_mask = torch.zeros((len(items), max_views), dtype=torch.bool)
@@ -237,5 +473,7 @@ def collate_samples(items):
         view_mask[index, :count] = True
     return {'images': images, 'view_mask': view_mask,
             'targets': torch.tensor([item['target'] for item in items], dtype=torch.float32),
+            'aux_targets': torch.tensor([list(item.get('aux_targets', ())) for item in items],
+                                        dtype=torch.float32).reshape(len(items), aux_width),
             'prediction_ids': [item['prediction_id'] for item in items],
             'sample_ids': [item['sample_ids'] for item in items]}

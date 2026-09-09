@@ -27,6 +27,7 @@ from scripts.convert_to_mds import build_parser as conversion_parser, convert
 from scripts.metrics import pf1, score_submission
 from scripts.training_common import (
     Cluster,
+    _split_logits,
     build_parser,
     positive_weight,
     run_epoch,
@@ -142,6 +143,49 @@ class TrainingLogicTests(unittest.TestCase):
         loaded = torch.load(path, map_location='cpu', weights_only=True)
         torch.testing.assert_close(loaded['model_state']['weight'], torch.tensor([1.0]))
 
+    def test_auxiliary_logits_are_split_and_weighted(self):
+        targets = torch.tensor([1.0, 0.0])
+        logits = torch.tensor([[2.0, -1.0], [-2.0, 3.0]])
+        main, aux = _split_logits(logits, targets, torch.tensor([[1.0], [0.0]]))
+        self.assertEqual(main.tolist(), [2.0, -2.0])
+        self.assertEqual(aux.tolist(), [[-1.0], [3.0]])
+        plain, none = _split_logits(torch.tensor([2.0, -2.0]), targets, torch.empty(2, 0))
+        self.assertEqual(plain.tolist(), [2.0, -2.0])
+        self.assertIsNone(none)
+        with self.assertRaisesRegex(ValueError, 'one value per target'):
+            _split_logits(logits, targets, None)
+        with self.assertRaisesRegex(ValueError, '3 logits per sample'):
+            _split_logits(logits, targets, torch.zeros(2, 2))
+
+    def test_auxiliary_loss_changes_gradients_only_when_weighted(self):
+        class TwoHead(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(1, 2)
+
+            def forward(self, images, view_mask):
+                return self.linear(images[:, 0, 0, 0, 0].unsqueeze(1))
+
+        def gradient(aux_weight):
+            torch.manual_seed(0)
+            model = TwoHead()
+            captured = []
+            model.linear.weight.register_hook(lambda grad: captured.append(grad.clone()))
+            batch = {'images': torch.full((2, 1, 3, 1, 1), 0.5),
+                     'view_mask': torch.ones(2, 1, dtype=torch.bool),
+                     'targets': torch.tensor([1.0, 0.0]),
+                     'aux_targets': torch.tensor([[1.0], [1.0]]),
+                     'prediction_ids': ['a', 'b'], 'sample_ids': [['a'], ['b']]}
+            optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+            run_epoch(model, [batch], torch.device('cpu'), optimizer=optimizer,
+                      scaler=torch.amp.GradScaler('cpu', enabled=False), no_progress=True,
+                      aux_weight=aux_weight)
+            return captured[-1]
+
+        torch.testing.assert_close(gradient(0.0)[1], torch.zeros(1))
+        self.assertGreater(gradient(0.5)[1].abs().item(), 0.0)
+        torch.testing.assert_close(gradient(0.0)[0], gradient(0.5)[0])
+
     def test_invalid_arguments_are_rejected(self):
         parser = build_parser('simple')
         for options in [('--epochs', '0'), ('--image-size', '32'), ('--grad-accum', '0'),
@@ -204,30 +248,97 @@ class TrainingSmokeTests(unittest.TestCase):
         images.mkdir()
         cls.csv_path = cls.root / 'train.csv'
         rows = []
+        cls.boxes = {}
         for patient in range(1, 5):
             for side in ['L', 'R']:
                 for view_index, view in enumerate(['CC', 'MLO']):
                     image_id = patient * 100 + (0 if side == 'L' else 10) + view_index
-                    pixels = np.arange(16 * 24, dtype=np.uint16).reshape(16, 24) * 100
+                    cancer = int(patient <= 2 and side == 'L')
+                    # A bright blob on a dark frame, on the side the vendor happens to use,
+                    # so ROI cropping and canonical flipping have something real to do.
+                    pixels = np.zeros((16, 24), dtype=np.uint16)
+                    box = (0, 3, 9, 13) if side == 'L' else (15, 3, 24, 13)
+                    pixels[box[1]:box[3], box[0]:box[2]] = 40000 + 1000 * view_index
                     Image.fromarray(pixels).save(images / f'{patient}_{image_id}.png')
-                    rows.append([patient, image_id, side, view, int(patient <= 2 and side == 'L')])
+                    cls.boxes[f'{patient}_{image_id}'] = box
+                    rows.append([patient, image_id, side, view, cancer,
+                                 max(cancer, int(patient == 3))])
         with cls.csv_path.open('w', newline='') as file:
             writer = csv.writer(file)
-            writer.writerow(['patient_id', 'image_id', 'laterality', 'view', 'cancer'])
+            writer.writerow(['patient_id', 'image_id', 'laterality', 'view', 'cancer', 'biopsy'])
             writer.writerows(rows)
+        cls.roi_csv = cls.root / 'roi_boxes.csv'
+        with cls.roi_csv.open('w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['sample_id', 'x0', 'y0', 'x1', 'y1'])
+            writer.writerows((sample_id, *box) for sample_id, box in cls.boxes.items())
         cls.remote = cls.root / 'mds'
         convert(conversion_parser().parse_args([
             '--csv', str(cls.csv_path), '--images-dir', str(images), '--out', str(cls.remote),
             '--workers', '1', '--prefetch', '1', '--no-progress',
         ]))
 
-    def args(self, approach, name):
+    def args(self, approach, name, extra=()):
         return build_parser(approach).parse_args([
             '--mds', str(self.remote), '--cache', str(self.root / f'cache-{name}'),
             '--out', str(self.root / f'run-{name}'), '--device', 'cpu', '--no-pretrained',
             '--image-size', '64', '--epochs', '1', '--folds', '2', '--batch-size', '2',
             '--grad-accum', '2', '--max-train-batches', '1', '--num-workers', '0', '--no-progress',
+            *extra,
         ])
+
+    def test_roi_oversampling_and_aux_heads_train_end_to_end(self):
+        variants = {
+            'cached-boxes': ['--roi-crop', '--roi-boxes', str(self.roi_csv),
+                             '--canonical-side', 'left', '--positive-fraction', '0.5',
+                             '--pos-weight', '1', '--aux-targets', 'biopsy', '--aux-weight', '0.3'],
+            'detected-boxes': ['--roi-crop', '--roi-margin', '0.1'],
+        }
+        for approach in ('advanced', 'vit'):
+            for name, extra in variants.items():
+                with self.subTest(approach=approach, variant=name):
+                    args = self.args(approach, f'{approach}-{name}', extra)
+                    with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), patch(
+                        'torchvision.models._api.load_state_dict_from_url',
+                        side_effect=AssertionError('Unexpected weights download'),
+                    ):
+                        history = train(args, approach)
+                    self.assertEqual(len(history), 1)
+                    self.assertEqual(history[0]['validation']['breasts'], 4)
+                    config = json.loads((args.out / 'config.json').read_text())
+                    self.assertTrue(config['roi_crop'])
+                    self.assertEqual(config['roi_boxes_cached'], name == 'cached-boxes')
+                    if name == 'cached-boxes':
+                        self.assertEqual(config['aux_targets'], ['biopsy'])
+                        self.assertEqual(config['model_outputs'], 2)
+                        self.assertEqual(config['positive_sampling'], 'balanced')
+                        self.assertEqual(config['canonical_side'], 'left')
+                    else:
+                        self.assertEqual(config['model_outputs'], 1)
+                        self.assertEqual(config['positive_sampling'], 'natural')
+                    score = score_submission(args.out / 'validation_labels.csv',
+                                             args.out / 'best_predictions.csv')
+                    self.assertAlmostEqual(score, history[0]['validation']['pf1'])
+
+    def test_new_features_are_off_by_default(self):
+        args = self.args('advanced', 'defaults-probe')
+        self.assertFalse(args.roi_crop)
+        self.assertIsNone(args.roi_boxes)
+        self.assertEqual(args.canonical_side, 'none')
+        self.assertIsNone(args.positive_fraction)
+        self.assertEqual(args.aux_targets, [])
+        for extra, message in (
+            (['--positive-fraction', '0'], 'positive-fraction'),
+            (['--positive-fraction', '1.5'], 'positive-fraction'),
+            (['--aux-targets', 'biopsy', 'biopsy'], 'repeat a column'),
+            (['--aux-targets', 'cancer'], 'cancer target itself'),
+            (['--aux-weight', '-1'], 'aux-weight'),
+            (['--roi-margin', '-0.1'], 'roi-margin'),
+            (['--roi-boxes', str(self.roi_csv)], 'no effect without'),
+            (['--roi-boxes', str(self.root / 'absent.csv'), '--roi-crop'], 'existing CSV'),
+        ):
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, message):
+                validate_args(self.args('advanced', 'reject-probe', extra), 'advanced')
 
     def test_real_simple_and_advanced_cpu_training(self):
         fold_files = []
