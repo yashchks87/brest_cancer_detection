@@ -1,0 +1,120 @@
+{
+  "os":  "Linux-5.15.0-1113-aws-x86_64-with-glibc2.39",
+  "python":  "CPython 3.12.3",
+  "startedAt":  "2026-09-14T19:10:49.275480Z",
+  "args":  [
+    "--encoder",
+    "convnext_tiny",
+    "--mds",
+    "/Volumes/daai_ke_team/default/images/cancer_dataset/shrads/cancer_dataset_mds_v4",
+    "--image-size",
+    "1024",
+    "512",
+    "--batch-size",
+    "2",
+    "--grad-accum",
+    "4",
+    "--intensity-max",
+    "4095",
+    "--lr",
+    "2e-5",
+    "--dropout",
+    "0.35",
+    "--weight-decay",
+    "0.05",
+    "--epochs",
+    "8",
+    "--ema-decay",
+    "0.999",
+    "--fold",
+    "2",
+    "--folds",
+    "5",
+    "--positive-fraction",
+    "0.2",
+    "--pos-weight",
+    "1",
+    "--augment",
+    "strong",
+    "--select-metric",
+    "average_precision",
+    "--view-chunk-size",
+    "2",
+    "--num-workers",
+    "4",
+    "--no-progress",
+    "--cache",
+    "/tmp/v4_cache",
+    "--cache-limit",
+    "60gb",
+    "--out",
+    "/Volumes/daai_ke_team/default/images/cancer_dataset/runs/t3_cnn_v4_dicom_1024x512_e8_f2",
+    "--wandb",
+    "--wandb-project",
+    "Brest-Cancer-Experiments",
+    "--wandb-entity",
+    "yashchks87",
+    "--wandb-tags",
+    "tier3",
+    "cnn",
+    "v4dicom",
+    "rect1024x512",
+    "fold2"
+  ],
+  "program":  "/root/brest_cancer_detection/scripts/train_advanced.py",
+  "codePath":  "scripts/train_advanced.py",
+  "codePathLocal":  "scripts/train_advanced.py",
+  "git":  {
+    "remote":  "https://github.com/yashchks87/brest_cancer_detection.git",
+    "commit":  "66b1f42675106f026e233fa1d78f298bca0ce604"
+  },
+  "email":  "yashchks87@gmail.com",
+  "root":  "/root/brest_cancer_detection",
+  "host":  "0617-134451-zyc049aq-10-1-38-55",
+  "executable":  "/root/brest_cancer_detection/venv/bin/python3.12",
+  "cpu_count":  48,
+  "cpu_count_logical":  96,
+  "gpu":  "NVIDIA A10G",
+  "gpu_count":  4,
+  "disk":  {
+    "/":  {
+      "total":  "157396975616",
+      "used":  "114496942080"
+    }
+  },
+  "memory":  {
+    "total":  "394914693120"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA A10G",
+      "memoryTotal":  "24146608128",
+      "cudaCores":  10240,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-92577656-bd34-d015-ec2c-b219316cab94"
+    },
+    {
+      "name":  "NVIDIA A10G",
+      "memoryTotal":  "24146608128",
+      "cudaCores":  10240,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-5318656f-8053-c2cd-36b1-67395817295d"
+    },
+    {
+      "name":  "NVIDIA A10G",
+      "memoryTotal":  "24146608128",
+      "cudaCores":  10240,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-58f86b0f-1fda-7f0d-1e98-7424acd60a58"
+    },
+    {
+      "name":  "NVIDIA A10G",
+      "memoryTotal":  "24146608128",
+      "cudaCores":  10240,
+      "architecture":  "Ampere",
+      "uuid":  "GPU-3c0949a3-441f-d8ba-85d3-fefefc8b1b69"
+    }
+  ],
+  "cudaVersion":  "13.0",
+  "writerId":  "qdynoc9svc7z12ptyu3bwrxyci59v2mh"
+}

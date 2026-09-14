@@ -1,0 +1,252 @@
+_wandb:
+    value:
+        cli_version: 0.29.0
+        e:
+            g6caz8ev56fz3a59zaoo24l84r5c9grl:
+                args:
+                    - --encoder
+                    - convnext_tiny
+                    - --mds
+                    - /Volumes/daai_ke_team/default/images/cancer_dataset/shrads/cancer_dataset_mds_v3
+                    - --image-size
+                    - "512"
+                    - --batch-size
+                    - "8"
+                    - --grad-accum
+                    - "1"
+                    - --lr
+                    - "2e-5"
+                    - --dropout
+                    - "0.35"
+                    - --weight-decay
+                    - "0.05"
+                    - --epochs
+                    - "8"
+                    - --ema-decay
+                    - "0.999"
+                    - --fold
+                    - "0"
+                    - --folds
+                    - "5"
+                    - --roi-crop
+                    - --roi-boxes
+                    - /root/roi/roi_boxes_v3.csv
+                    - --canonical-side
+                    - left
+                    - --positive-fraction
+                    - "0.2"
+                    - --pos-weight
+                    - "1"
+                    - --augment
+                    - strong
+                    - --select-metric
+                    - average_precision
+                    - --view-chunk-size
+                    - "2"
+                    - --num-workers
+                    - "2"
+                    - --no-progress
+                    - --cache
+                    - /tmp/t2_cache
+                    - --out
+                    - /Volumes/daai_ke_team/default/images/cancer_dataset/runs/t2_cnn_roibal_augstrong_img512_e8_f0
+                    - --wandb
+                    - --wandb-project
+                    - Brest-Cancer-Experiments
+                    - --wandb-entity
+                    - yashchks87
+                    - --wandb-tags
+                    - tier2
+                    - cnn
+                    - roi_bal
+                    - augstrong
+                    - img512
+                    - fold0
+                codePath: scripts/train_advanced.py
+                codePathLocal: scripts/train_advanced.py
+                cpu_count: 48
+                cpu_count_logical: 96
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "157396975616"
+                        used: "77920178176"
+                email: yashchks87@gmail.com
+                executable: /root/brest_cancer_detection/venv/bin/python3.12
+                git:
+                    commit: 66b1f42675106f026e233fa1d78f298bca0ce604
+                    remote: https://github.com/yashchks87/brest_cancer_detection.git
+                gpu: NVIDIA A10G
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Ampere
+                      cudaCores: 10240
+                      memoryTotal: "24146608128"
+                      name: NVIDIA A10G
+                      uuid: GPU-92577656-bd34-d015-ec2c-b219316cab94
+                    - architecture: Ampere
+                      cudaCores: 10240
+                      memoryTotal: "24146608128"
+                      name: NVIDIA A10G
+                      uuid: GPU-5318656f-8053-c2cd-36b1-67395817295d
+                    - architecture: Ampere
+                      cudaCores: 10240
+                      memoryTotal: "24146608128"
+                      name: NVIDIA A10G
+                      uuid: GPU-58f86b0f-1fda-7f0d-1e98-7424acd60a58
+                    - architecture: Ampere
+                      cudaCores: 10240
+                      memoryTotal: "24146608128"
+                      name: NVIDIA A10G
+                      uuid: GPU-3c0949a3-441f-d8ba-85d3-fefefc8b1b69
+                host: 0617-134451-zyc049aq-10-1-38-55
+                memory:
+                    total: "394914693120"
+                os: Linux-5.15.0-1113-aws-x86_64-with-glibc2.39
+                program: /root/brest_cancer_detection/scripts/train_advanced.py
+                python: CPython 3.12.3
+                root: /root/brest_cancer_detection
+                startedAt: "2026-09-13T21:16:41.661090Z"
+                writerId: g6caz8ev56fz3a59zaoo24l84r5c9grl
+        m: []
+        python_version: 3.12.3
+        t:
+            "1":
+                - 1
+                - 11
+                - 41
+                - 49
+            "2":
+                - 1
+                - 11
+                - 41
+                - 49
+            "3":
+                - 2
+                - 13
+                - 15
+                - 16
+                - 62
+                - 61
+            "4": 3.12.3
+            "5": 0.29.0
+            "6": 4.57.6
+            "12": 0.29.0
+            "13": linux-x86_64
+amp_dtype:
+    value: torch.bfloat16
+approach:
+    value: advanced
+arguments:
+    value:
+        amp: true
+        augment: strong
+        aux_targets: []
+        aux_weight: 0.2
+        batch_size: 8
+        cache: /tmp/t2_cache
+        cache_limit: 20gb
+        canonical_side: left
+        clip_grad: 1
+        csv: null
+        device: auto
+        dropout: 0.35
+        ema_decay: 0.999
+        encoder: convnext_tiny
+        epochs: 8
+        exclude_folds: []
+        fold: 0
+        folds: 5
+        grad_accum: 1
+        image_size: 512
+        intensity_max: null
+        lr: 2e-05
+        max_train_batches: null
+        max_views: 2
+        mds: /Volumes/daai_ke_team/default/images/cancer_dataset/shrads/cancer_dataset_mds_v3
+        no_progress: true
+        num_workers: 2
+        out: /Volumes/daai_ke_team/default/images/cancer_dataset/runs/t2_cnn_roibal_augstrong_img512_e8_f0
+        pooling: mean
+        pos_weight: "1"
+        positive_fraction: 0.2
+        pretrained: true
+        roi_boxes: /root/roi/roi_boxes_v3.csv
+        roi_crop: true
+        roi_margin: 0.05
+        save_epochs: true
+        seed: 42
+        select_metric: average_precision
+        view_chunk_size: 2
+        wandb: true
+        wandb_entity: yashchks87
+        wandb_mode: online
+        wandb_project: Brest-Cancer-Experiments
+        wandb_run_name: null
+        wandb_tags:
+            - tier2
+            - cnn
+            - roi_bal
+            - augstrong
+            - img512
+            - fold0
+        weight_decay: 0.05
+augment:
+    value: strong
+aux_targets:
+    value: []
+aux_weight:
+    value: 0
+canonical_side:
+    value: left
+constant_prevalence_pf1:
+    value: 0.0208442746729738
+dataset:
+    value:
+        csv_sha256: 35408731b67b87272f85874ee3c4c9d5cea7a2c4fbcaeac3fbe415ba1a5817c1
+        index_sha256: b9c37853d304166361a1832033633498d69c530af0d620b5131fdb081b6aae2f
+        path: /Volumes/daai_ke_team/default/images/cancer_dataset/shrads/cancer_dataset_mds_v3
+        samples: 54687
+        skipped_missing_images: 19
+device:
+    value: cuda:0
+effective_batch_breasts_or_images:
+    value: 32
+excluded_folds:
+    value: []
+excluded_images:
+    value: 0
+excluded_patients:
+    value: 0
+model_outputs:
+    value: 1
+positive_loss_weight:
+    value: 1
+positive_sampling:
+    value: balanced
+roi_boxes_cached:
+    value: true
+roi_crop:
+    value: true
+selection_metric:
+    value: average_precision
+torch_version:
+    value: 2.14.0+cu130
+train_breasts:
+    value: 19058
+train_images:
+    value: 43673
+train_positive_breast_fraction:
+    value: 0.020516318606359534
+train_positive_breasts:
+    value: 391
+validation_breasts:
+    value: 4768
+validation_images:
+    value: 11014
+validation_positive_breasts:
+    value: 101
+validation_weights:
+    value: ema
+world_size:
+    value: 4

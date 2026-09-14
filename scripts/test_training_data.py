@@ -32,6 +32,7 @@ from scripts.training_data import (
     collate_samples,
     expand_box,
     load_training_records,
+    normalise_size,
     patient_fold_assignments,
     read_roi_boxes,
     roi_bounding_box,
@@ -447,6 +448,72 @@ class TransformTests(unittest.TestCase):
         self.assertFalse(torch.equal(first, transform(pixels)))
         self.assertEqual(first.shape, (3, 12, 12))
         self.assertTrue(torch.isfinite(first).all())
+
+    def test_rectangular_canvas_preserves_aspect_without_wasting_padding(self):
+        # A 2:1 breast ROI fills a 2:1 canvas edge to edge, but wastes half a square one.
+        tall = np.full((64, 32), 255, dtype=np.uint8)
+        rectangular = self.unnormalize(ImageTransform((64, 32))(tall))
+        self.assertEqual(rectangular.shape, (3, 64, 32))
+        self.assertGreater(rectangular.min().item(), 0.99)
+        square = self.unnormalize(ImageTransform(64)(tall))
+        self.assertEqual(square.shape, (3, 64, 64))
+        self.assertLess((square > 0.5).float().mean().item(), 0.55)
+
+    def test_rectangular_canvas_pads_the_short_axis_and_centres(self):
+        wide = self.unnormalize(ImageTransform((8, 16))(np.full((2, 8), 255, dtype=np.uint8)))
+        expected = torch.zeros(3, 8, 16)
+        expected[:, 2:6] = 1
+        torch.testing.assert_close(wide, expected)
+
+    def test_size_normalisation_accepts_int_or_pair_and_rejects_junk(self):
+        self.assertEqual(normalise_size(64), (64, 64))
+        self.assertEqual(normalise_size((64, 32)), (64, 32))
+        self.assertEqual(normalise_size([64, 32]), (64, 32))
+        for bad in (0, -1, (64,), (64, 32, 16), (64.0, 32), 'big', (0, 32), True):
+            with self.subTest(size=bad), self.assertRaises(ValueError):
+                normalise_size(bad)
+
+    def test_strong_augmentation_on_a_rectangular_canvas(self):
+        pixels = np.full((128, 64), 200, dtype=np.uint8)
+        transform = ImageTransform((96, 48), training=True, augment='strong')
+        torch.manual_seed(11)
+        output = transform(pixels)
+        self.assertEqual(output.shape, (3, 96, 48))
+        self.assertTrue(torch.isfinite(output).all())
+
+    def test_strong_augmentation_stays_in_range_and_is_seeded(self):
+        pixels = np.full((64, 32), 200, dtype=np.uint8)
+        strong = ImageTransform(32, training=True, augment='strong')
+        torch.manual_seed(3)
+        first = strong(pixels)
+        torch.manual_seed(3)
+        torch.testing.assert_close(first, strong(pixels))
+        torch.manual_seed(4)
+        self.assertFalse(torch.equal(first, strong(pixels)))
+        self.assertEqual(first.shape, (3, 32, 32))
+        values = self.unnormalize(first)
+        self.assertTrue(torch.isfinite(values).all())
+        self.assertGreaterEqual(values.min().item(), -1e-5)
+        self.assertLessEqual(values.max().item(), 1 + 1e-5)
+
+    def test_strong_augmentation_occludes_and_differs_from_light(self):
+        pixels = np.full((48, 48), 255, dtype=np.uint8)
+        torch.manual_seed(5)
+        light = self.unnormalize(ImageTransform(48, training=True)(pixels))
+        torch.manual_seed(5)
+        strong = self.unnormalize(ImageTransform(48, training=True, augment='strong')(pixels))
+        self.assertFalse(torch.allclose(light, strong))
+        # Coarse dropout blanks at least two holes of 6% of the side length.
+        holes = (strong[0] <= 1e-6).sum().item()
+        self.assertGreaterEqual(holes, 2 * round(0.06 * 48) ** 2 * 0.5)
+
+    def test_strong_augmentation_is_training_only_and_validated(self):
+        pixels = np.arange(256, dtype=np.uint8).reshape(16, 16)
+        torch.manual_seed(6)
+        strong_eval = ImageTransform(16, augment='strong')(pixels)
+        torch.testing.assert_close(strong_eval, ImageTransform(16)(pixels))
+        with self.assertRaisesRegex(ValueError, 'augment'):
+            ImageTransform(16, augment='heavy')
 
     def test_invalid_ranges_shapes_and_dtypes(self):
         arrays = [np.array([0, 1]), np.empty((0, 2), dtype=np.uint8),

@@ -18,6 +18,13 @@ AUX_TARGET_VALUES = {'0': 0.0, '1': 1.0, 'False': 0.0, 'True': 1.0}
 ROI_ANALYSIS_SIZE = 256
 ROI_THRESHOLD = 0.05
 ROI_MIN_AREA_FRACTION = 0.01
+AUGMENTATIONS = ('light', 'strong')
+AUGMENT_ROTATION = 15.0
+AUGMENT_SCALE = 0.12
+AUGMENT_SHIFT = 0.08
+AUGMENT_INTENSITY = 0.2
+AUGMENT_HOLE_FRACTION = 0.06
+AUGMENT_HOLES = (2, 4)
 
 
 @dataclass(frozen=True)
@@ -247,12 +254,26 @@ def read_roi_boxes(path: Path) -> dict[str, tuple[int, int, int, int]]:
     return boxes
 
 
+def normalise_size(size) -> tuple[int, int]:
+    """Accept a square side or an explicit (height, width) for aspect-preserving inputs."""
+    if type(size) is int:
+        values = (size, size)
+    elif isinstance(size, (tuple, list)) and len(size) == 2 and all(type(v) is int for v in size):
+        values = (size[0], size[1])
+    else:
+        raise ValueError('Image size must be an integer or a (height, width) pair of integers.')
+    if any(value < 1 for value in values):
+        raise ValueError('Image size must be positive.')
+    return values
+
+
 class ImageTransform:
-    def __init__(self, size: int, training: bool = False, intensity_max: float | None = None,
+    def __init__(self, size, training: bool = False, intensity_max: float | None = None,
                  roi_crop: bool = False, roi_margin: float = 0.05,
-                 canonical_side: str | None = None):
-        if type(size) is not int or size < 1:
-            raise ValueError('Image size must be a positive integer.')
+                 canonical_side: str | None = None, augment: str = 'light'):
+        height, width = normalise_size(size)
+        if augment not in AUGMENTATIONS:
+            raise ValueError(f'augment must be one of {sorted(AUGMENTATIONS)}.')
         if intensity_max is not None and (not math.isfinite(intensity_max) or intensity_max <= 0):
             raise ValueError('intensity_max must be finite and positive.')
         if not isinstance(roi_crop, bool):
@@ -261,12 +282,14 @@ class ImageTransform:
             raise ValueError('roi_margin must be finite and nonnegative.')
         if canonical_side not in (None, 'left', 'right'):
             raise ValueError("canonical_side must be None, 'left', or 'right'.")
-        self.size = size
+        self.height, self.width = height, width
+        self.size = height if height == width else (height, width)
         self.training = training
         self.intensity_max = intensity_max
         self.roi_crop = roi_crop
         self.roi_margin = roi_margin
         self.canonical_side = canonical_side
+        self.augment = augment
 
     def _needs_canonical_flip(self, box, frame_width: int) -> bool:
         if self.canonical_side is None:
@@ -312,18 +335,44 @@ class ImageTransform:
         if canonical_flip:
             image = TF.hflip(image)
         height, width = image.shape[-2:]
-        ratio = self.size / max(height, width)
+        ratio = min(self.height / height, self.width / width)
         height, width = max(1, round(height * ratio)), max(1, round(width * ratio))
         image = TF.resize(image, [height, width], interpolation=InterpolationMode.BILINEAR, antialias=True)
-        left, top = (self.size - width) // 2, (self.size - height) // 2
-        image = TF.pad(image, [left, top, self.size - width - left, self.size - height - top])
+        left, top = (self.width - width) // 2, (self.height - height) // 2
+        image = TF.pad(image, [left, top, self.width - width - left, self.height - height - top])
         if self.training:
             if torch.rand(()).item() < 0.5:
                 image = TF.hflip(image)
-            angle = torch.empty(()).uniform_(-5, 5).item()
-            image = TF.rotate(image, angle, interpolation=InterpolationMode.BILINEAR, expand=True)
-            image = TF.resize(image, [self.size, self.size], antialias=True)
+            if self.augment == 'strong':
+                image = self._strong_augment(image)
+            else:
+                angle = torch.empty(()).uniform_(-5, 5).item()
+                image = TF.rotate(image, angle, interpolation=InterpolationMode.BILINEAR, expand=True)
+                image = TF.resize(image, [self.height, self.width], antialias=True)
         return TF.normalize(image, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]).contiguous()
+
+    def _strong_augment(self, image: torch.Tensor) -> torch.Tensor:
+        """Geometry, intensity, and occlusion jitter for the low-positive regime.
+
+        Intensity uses gain and gamma rather than an additive brightness shift so the
+        zero background of a mammogram stays zero and the ROI crop keeps its meaning.
+        """
+        angle = torch.empty(()).uniform_(-AUGMENT_ROTATION, AUGMENT_ROTATION).item()
+        scale = 1.0 + torch.empty(()).uniform_(-AUGMENT_SCALE, AUGMENT_SCALE).item()
+        translate = [round(torch.empty(()).uniform_(-AUGMENT_SHIFT, AUGMENT_SHIFT).item() * extent)
+                     for extent in (self.width, self.height)]
+        image = TF.affine(image, angle=angle, translate=translate, scale=scale, shear=[0.0, 0.0],
+                          interpolation=InterpolationMode.BILINEAR, fill=0.0)
+        gain = 1.0 + torch.empty(()).uniform_(-AUGMENT_INTENSITY, AUGMENT_INTENSITY).item()
+        gamma = 1.0 + torch.empty(()).uniform_(-AUGMENT_INTENSITY, AUGMENT_INTENSITY).item()
+        image = (image.clamp(0.0, 1.0) ** gamma * gain).clamp_(0.0, 1.0)
+        side = max(1, round(AUGMENT_HOLE_FRACTION * min(self.height, self.width)))
+        holes = int(torch.randint(AUGMENT_HOLES[0], AUGMENT_HOLES[1] + 1, ()).item())
+        for _ in range(holes):
+            top = int(torch.randint(0, max(1, self.height - side), ()).item())
+            left = int(torch.randint(0, max(1, self.width - side), ()).item())
+            image[:, top:top + side, left:left + side] = 0.0
+        return image
 
 
 class ImageDataset(Dataset):

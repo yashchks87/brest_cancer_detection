@@ -24,12 +24,14 @@ from tqdm import tqdm
 from scripts.benchmark_mds import RSNAStreamingDataset, validate_paths
 from scripts.metrics import aggregate_predictions, pf1
 from scripts.training_data import (
+    AUGMENTATIONS,
     BalancedDistributedSampler,
     BreastDataset,
     ImageDataset,
     ImageTransform,
     collate_samples,
     load_training_records,
+    normalise_size,
     patient_fold_assignments,
     read_roi_boxes,
 )
@@ -38,6 +40,7 @@ from scripts.training_models import CNN_ENCODERS, DEFAULT_CNN_ENCODER, build_mod
 
 DEFAULT_MDS = Path('/Volumes/daai_ke_team/default/images/cancer_dataset/shrads/cancer_dataset_mds_v3')
 BREAST_APPROACHES = ('advanced', 'vit')
+SELECTION_METRICS = ('pf1', 'average_precision', 'roc_auc')
 DESCRIPTIONS = {
     'simple': 'Train a ResNet-18 image baseline with breast-level validation.',
     'advanced': 'Train ConvNeXt-Tiny multi-view breast attention pooling.',
@@ -273,9 +276,12 @@ def build_parser(approach):
     parser.add_argument('--out', type=Path, required=True,
                         help='New run directory under an existing parent; use /Volumes for persistence.')
     parser.add_argument('--epochs', type=int, default=5 if approach == 'simple' else 10)
-    parser.add_argument('--image-size', type=int,
-                        default={'simple': 512, 'advanced': 1024, 'vit': 384}[approach],
-                        help='Square canvas after aspect-preserving padding; ViT requires a multiple of 16.')
+    parser.add_argument('--image-size', type=int, nargs='+', metavar=('HEIGHT', 'WIDTH'),
+                        default=[{'simple': 512, 'advanced': 1024, 'vit': 384}[approach]],
+                        help='Canvas after aspect-preserving padding: one value for a square, or '
+                             'HEIGHT WIDTH for a rectangle matching the breast aspect (roughly 2:1 '
+                             'on ROI-cropped data), which avoids wasting half the tensor on padding. '
+                             'ViT requires a square that is a multiple of 16.')
     parser.add_argument('--batch-size', type=int, default=16 if approach == 'simple' else 1)
     parser.add_argument('--grad-accum', type=int, default=1 if approach == 'simple' else 8)
     parser.add_argument('--lr', type=float, default=3e-5 if approach == 'vit' else 1e-4)
@@ -318,6 +324,12 @@ def build_parser(approach):
     parser.add_argument('--positive-fraction', type=float,
                         help='Resample each epoch to this fraction of positive breasts, e.g. 0.2 '
                              'for 1:4. Off by default. Lower --pos-weight when enabling this.')
+    parser.add_argument('--augment', choices=AUGMENTATIONS, default='light',
+                        help="Training augmentation: light is hflip plus +/-5 degrees; strong adds "
+                             "affine scale/shift, +/-15 degrees, gain/gamma jitter, and coarse dropout.")
+    parser.add_argument('--select-metric', choices=SELECTION_METRICS, default='pf1',
+                        help='Validation metric used to pick best.pt and best_predictions.csv. '
+                             'pF1 rewards confidence drift; average_precision is the stable choice.')
     parser.add_argument('--aux-targets', nargs='*', default=[], metavar='COLUMN',
                         help='Extra binary CSV columns predicted by auxiliary heads, e.g. biopsy '
                              'invasive. They densify supervision but never change the pF1 target.')
@@ -357,10 +369,15 @@ def validate_args(args, approach='simple'):
     for name in ('epochs', 'batch_size', 'grad_accum', 'max_views', 'view_chunk_size'):
         if getattr(args, name) < 1:
             raise ValueError(f'--{name.replace("_", "-")} must be positive.')
-    if args.image_size < 64 or args.num_workers < 0:
+    sizes = [args.image_size] if type(args.image_size) is int else list(args.image_size)
+    if not 1 <= len(sizes) <= 2:
+        raise ValueError('--image-size takes one value for a square or two for HEIGHT WIDTH.')
+    height, width = normalise_size(sizes * 2 if len(sizes) == 1 else sizes)
+    args.image_size = [height, width]
+    if min(height, width) < 64 or args.num_workers < 0:
         raise ValueError('--image-size must be at least 64 and --num-workers must be nonnegative.')
-    if approach == 'vit' and args.image_size % 16:
-        raise ValueError('--image-size must be a multiple of 16 for the ViT patch grid.')
+    if approach == 'vit' and (height != width or height % 16):
+        raise ValueError('--image-size must be a square multiple of 16 for the ViT patch grid.')
     if args.folds < 2 or not 0 <= args.fold < args.folds:
         raise ValueError('--folds must be at least 2 and --fold must be in 0..folds-1.')
     excluded = sorted(set(args.exclude_folds))
@@ -438,7 +455,7 @@ def _wandb_init(args, approach, config, cluster):
     )
 
 
-def _wandb_log_epoch(run, result, best_score):
+def _wandb_log_epoch(run, result, best_pf1, select_metric='pf1', best_selection=None):
     if run is None:
         return
     metrics = {
@@ -447,7 +464,9 @@ def _wandb_log_epoch(run, result, best_score):
         'train/samples': result['train_samples'],
         'train/optimizer_steps': result['optimizer_steps'],
         'val/loss': result['validation_loss'],
-        'val/best_pf1': best_score,
+        'val/best_pf1': best_pf1,
+        'val/overfit_ratio': result['validation_loss'] / result['train_loss'],
+        f'val/best_{select_metric}': best_pf1 if best_selection is None else best_selection,
         'epoch/elapsed_seconds': result['elapsed_seconds'],
     }
     metrics.update({f'val/{key}': value for key, value in result['validation'].items()})
@@ -503,8 +522,10 @@ def _train(args, approach, cluster, device):
                                    shuffle=False, batch_size=1, cache_limit=args.cache_limit)
     transform_kwargs = dict(intensity_max=args.intensity_max, roi_crop=args.roi_crop,
                             roi_margin=args.roi_margin, canonical_side=canonical_side)
-    train_transform = ImageTransform(args.image_size, training=True, **transform_kwargs)
-    val_transform = ImageTransform(args.image_size, training=False, **transform_kwargs)
+    image_size = tuple(args.image_size)
+    train_transform = ImageTransform(image_size, training=True, augment=args.augment,
+                                     **transform_kwargs)
+    val_transform = ImageTransform(image_size, training=False, **transform_kwargs)
     if approach in BREAST_APPROACHES:
         train_dataset = BreastDataset(backend, records, train_indices, train_transform,
                                       max_views=args.max_views, training=True, roi_boxes=roi_boxes)
@@ -515,7 +536,7 @@ def _train(args, approach, cluster, device):
         val_dataset = ImageDataset(backend, records, val_indices, val_transform, roi_boxes)
     weight = positive_weight(train_dataset.targets, args.pos_weight)
     raw_model = build_model(approach, pretrained=args.pretrained, dropout=args.dropout,
-                            image_size=args.image_size, encoder=args.encoder,
+                            image_size=image_size[0], encoder=args.encoder,
                             num_outputs=1 + len(aux_targets),
                             view_chunk_size=(args.view_chunk_size if approach in BREAST_APPROACHES
                                              else args.batch_size)).to(device)
@@ -578,6 +599,8 @@ def _train(args, approach, cluster, device):
         'aux_targets': list(aux_targets),
         'aux_weight': args.aux_weight if aux_targets else 0.0,
         'model_outputs': 1 + len(aux_targets),
+        'augment': args.augment,
+        'selection_metric': args.select_metric,
     }
     run = None
     cluster.barrier()
@@ -596,7 +619,7 @@ def _train(args, approach, cluster, device):
             writer.writerows(val_truth.items())
         print(json.dumps({'event': 'setup', **config}, allow_nan=False), flush=True)
         run = _wandb_init(args, approach, config, cluster)
-    best_score = -math.inf
+    best_score = best_pf1 = -math.inf
     history = []
     for epoch in range(1, args.epochs + 1):
         start = time.perf_counter()
@@ -629,8 +652,9 @@ def _train(args, approach, cluster, device):
         history.append(result)
         if scheduler is not None:
             scheduler.step()
-        improved = metrics['pf1'] > best_score
-        best_score = max(best_score, metrics['pf1'])
+        improved = metrics[args.select_metric] > best_score
+        best_score = max(best_score, metrics[args.select_metric])
+        best_pf1 = max(best_pf1, metrics['pf1'])
         if cluster.primary:
             write_predictions(output / f'validation_predictions_epoch_{epoch:03d}.csv', rows)
             if args.save_epochs:
@@ -650,7 +674,7 @@ def _train(args, approach, cluster, device):
                 'optimizer_state': optimizer.state_dict(),
                 'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
                 'scaler_state': scaler.state_dict(), 'epoch': epoch, 'metrics': metrics,
-                'best_pf1': best_score, 'config': config,
+                'best_pf1': best_pf1, 'best_selection_score': best_score, 'config': config,
             })
             with (output / f'metrics_epoch_{epoch:03d}.json').open('x', encoding='utf-8') as file:
                 json.dump(result, file, indent=2, allow_nan=False)
@@ -659,15 +683,17 @@ def _train(args, approach, cluster, device):
                 for row in history:
                     file.write(json.dumps(row, allow_nan=False) + '\n')
             print(json.dumps({'event': 'epoch', **result}, allow_nan=False), flush=True)
-            _wandb_log_epoch(run, result, best_score)
+            _wandb_log_epoch(run, result, best_pf1, args.select_metric, best_score)
         cluster.barrier()
     if cluster.primary:
         with (output / '_TRAINING_SUCCESS').open('x', encoding='utf-8') as file:
-            json.dump({'epochs': args.epochs, 'best_pf1': best_score, 'world_size': cluster.world_size},
-                      file, allow_nan=False)
+            json.dump({'epochs': args.epochs, 'best_pf1': best_pf1,
+                       'selection_metric': args.select_metric, 'best_selection_score': best_score,
+                       'world_size': cluster.world_size}, file, allow_nan=False)
             file.write('\n')
         if run is not None:
-            run.summary['best_pf1'] = best_score
+            run.summary['best_pf1'] = best_pf1
+            run.summary[f'best_{args.select_metric}'] = best_score
             run.finish()
     return history
 

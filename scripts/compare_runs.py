@@ -27,7 +27,8 @@ def load_run(directory: Path) -> dict:
         raise ValueError(f'Run has no epoch metrics or an unsupported approach: {directory}')
     if [row['epoch'] for row in epochs] != list(range(1, len(epochs) + 1)):
         raise ValueError(f'Run epoch metrics are not contiguous: {directory}')
-    best = max(epochs, key=lambda row: row['validation']['pf1'])
+    selection = config.get('selection_metric', 'pf1')
+    best = max(epochs, key=lambda row: row['validation'][selection])
     predictions = read_predictions(directory / 'best_predictions.csv')
     labels = read_predictions(directory / 'validation_labels.csv')
     if predictions.keys() != labels.keys():

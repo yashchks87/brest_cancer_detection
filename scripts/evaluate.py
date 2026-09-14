@@ -27,6 +27,7 @@ from scripts.training_data import (
     ImageTransform,
     collate_samples,
     load_training_records,
+    normalise_size,
     patient_fold_assignments,
 )
 from scripts.training_models import build_model
@@ -98,13 +99,16 @@ def evaluate(args: argparse.Namespace) -> dict:
     torch.manual_seed(settings['seed'])
     backend = RSNAStreamingDataset(remote=str(remote), local=str(local), decode_images=True,
                                    shuffle=False, batch_size=1, cache_limit=args.cache_limit)
-    transform = ImageTransform(settings['image_size'], training=False,
+    # Runs before rectangular inputs stored a scalar; newer ones store [height, width].
+    image_size = normalise_size(settings['image_size'] if type(settings['image_size']) is int
+                                else list(settings['image_size']))
+    transform = ImageTransform(image_size, training=False,
                                intensity_max=settings['intensity_max'])
     dataset = (BreastDataset(backend, records, indices, transform, training=False)
                if approach in BREAST_APPROACHES
                else ImageDataset(backend, records, indices, transform))
     model = build_model(approach, pretrained=False, dropout=settings['dropout'],
-                        image_size=settings['image_size'],
+                        image_size=image_size[0],
                         view_chunk_size=args.view_chunk_size or settings['view_chunk_size'])
     state, weights = select_weights(checkpoint, args.weights)
     model.load_state_dict(state)
